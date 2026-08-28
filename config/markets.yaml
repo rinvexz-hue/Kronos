@@ -1,0 +1,117 @@
+# Kronos Market Desk — instrument definitions.
+# Single source of truth: application code must never hardcode a symbol.
+#
+# `decimals` drives ALL display/rounding — never round display values with
+# a naive default; always look this up per instrument.
+#
+# `source` selects the adapter in src/kmd/data/. `source_symbol` is what
+# gets passed to that adapter's API; `display_symbol` is what the UI and
+# snapshot JSON show. yfinance ticker choices below are STARTING POINTS
+# per the upstream README's own suggestions — builder-data must verify
+# empirically which of these (or an alternate) actually returns usable
+# OHLCV history and record the result in NOTES/data_sources.md, then
+# correct this file if a listed ticker turns out to be dead or thin.
+
+timeframes:
+  primary: "1h"
+  secondary: ["4h", "1d"]
+
+forecast:
+  lookback_bars: 400
+  pred_len: 24
+
+sessions:
+  # Used by the status bar to show "market open/closed" for non-24/7
+  # instruments. Hours are in the instrument's home exchange local time;
+  # builder-data converts to UTC using a real tz database, never a fixed
+  # UTC offset (DST matters here).
+  crypto: { always_open: true }
+  metals_futures:
+    always_open: false
+    weekday_open: "sun 23:00"   # CME Globex-style near-continuous week
+    weekday_close: "fri 22:00"
+    timezone: "America/Chicago"
+  fx:
+    always_open: false
+    weekday_open: "sun 22:00"
+    weekday_close: "fri 22:00"
+    timezone: "UTC"
+  index:
+    always_open: false
+    weekday_open: "mon 13:30"
+    weekday_close: "mon 20:00"  # placeholder single-session template; real
+                                 # sessions are looked up per-weekday by
+                                 # builder-data, this is not a full schedule
+    timezone: "America/New_York"
+
+groups:
+  crypto:
+    session: crypto
+    instruments:
+      - display_symbol: "BTC/USDT"
+        decimals: 2
+        source: ccxt
+        exchange: binance
+        source_symbol: "BTC/USDT"
+        fallback_exchange: coinbase
+        fallback_source_symbol: "BTC/USD"
+      - display_symbol: "XRP/USDT"
+        decimals: 4
+        source: ccxt
+        exchange: binance
+        source_symbol: "XRP/USDT"
+        fallback_exchange: coinbase
+        fallback_source_symbol: "XRP/USD"
+
+  metals:
+    session: metals_futures
+    instruments:
+      - display_symbol: "GOUD"
+        decimals: 2
+        source: yfinance
+        source_symbol: "GC=F"
+        fallback_source_symbol: "XAUUSD=X"
+      - display_symbol: "ZILVER"
+        decimals: 3
+        source: yfinance
+        source_symbol: "SI=F"
+        fallback_source_symbol: "XAGUSD=X"
+
+  fx:
+    session: fx
+    instruments:
+      - display_symbol: "EUR/USD"
+        decimals: 5
+        source: yfinance
+        source_symbol: "EURUSD=X"
+        fallback_source_symbol: null
+      - display_symbol: "USD/JPY"
+        decimals: 3
+        source: yfinance
+        source_symbol: "JPY=X"
+        fallback_source_symbol: "USDJPY=X"
+
+  context:
+    # Context instruments are fetched and stored like any other symbol,
+    # but are shown as an analysis overlay (e.g. DXY vs GOUD), never as
+    # a first-class forecast tile in the primary grid.
+    session: index
+    instruments:
+      - display_symbol: "DXY"
+        decimals: 2
+        source: yfinance
+        source_symbol: "DX-Y.NYB"
+        fallback_source_symbol: null
+      - display_symbol: "S&P 500"
+        decimals: 2
+        source: yfinance
+        source_symbol: "^GSPC"
+        fallback_source_symbol: null
+
+risk:
+  min_rr_for_setup: 2.0
+  default_risk_pct: 2.0
+
+calibration:
+  min_observations_for_display: 30
+  target_band_coverage: 0.80
