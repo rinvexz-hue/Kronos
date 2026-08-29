@@ -437,3 +437,61 @@ value derived from the data; a real multi-week exchange holiday could
 still exceed it, in which case the affected forecasts are correctly
 marked unscorable rather than incorrectly scored against an unrelated
 much-later bar.
+
+## 8. Round 3 (red-team + alpha-scout combined pass): small direct fixes
+
+Four small, unambiguous fixes made directly during Round 3, per that
+round's own fix-vs-proposal rule — see `REVIEW.md`'s Round 3 section for
+the full findings this came out of.
+
+**a. Removed two confirmed-dead functions:** `kmd.config.get_settings()`
+(every real call site constructs `Settings()` directly — `api.py`,
+`__main__.py`, every test — the wrapper had zero callers) and
+`ForecastCacheKey.from_result()` (`forecast/cache.py`) — never called
+anywhere, and conceptually backwards for this cache's actual flow besides:
+the whole point of a cache key is to be computable *before* running Monte
+Carlo, to decide whether to run it at all, so a constructor that instead
+takes an already-computed `MonteCarloResult` could never be reached by the
+real cache-check path in `snapshot.py::_get_or_compute_forecast` (which
+builds the key from `instrument`/`timeframe`/`settings` directly). Verified
+dead via `grep` for each name across `src/` and `tests/` before removing;
+`ruff check .`/`python -m mypy`/`python -m pytest tests -q` unchanged
+(207 passed) after removal, confirming no hidden caller.
+
+**b. `web/app.js`'s status bar showed a source as fresh/error-free even
+when a specific instrument sharing that `source_name` was actually stale.**
+`renderStatusBar` deduped by `source_name` (multiple instruments share one,
+e.g. every yfinance-backed instrument) by keeping whichever asset's status
+happened to appear FIRST in `snapshot.assets` — confirmed by a real
+Playwright screenshot of a constructed fixture (GOUD fresh, ZILVER stale,
+both `source_name: "yfinance"`, GOUD ordered first): the status bar showed
+a green, non-stale "yfinance" chip even though ZILVER was genuinely stale
+with active errors. This is exactly the "stale data shown as if live"
+failure mode `red-team`'s own checklist item #6 forbids, just one level up
+(the aggregate status bar) from where Round 2 already checked it
+(individual asset tiles/detail view). **Fix:** aggregate conservatively —
+`is_stale` is OR'd, `error_count_last_hour` is maxed, `last_update_utc`
+keeps the OLDEST timestamp — across every asset sharing a `source_name`,
+so one stale/erroring instrument can never be hidden behind a healthy one
+with the same nominal source. Re-verified visually after the fix: the same
+fixture now shows the yfinance chip correctly orange/stale.
+
+**c. `error_count_last_hour`'s frontend label claimed a precision the
+number doesn't have.** The backend field (see decision #5e) is actually a
+proxy — `SourceHealth.consecutive_failures`, i.e. consecutive failures
+since the last success — not a true rolling one-hour window count, but the
+UI labeled it "Fouten (laatste uur)" ("errors in the last hour"), asserting
+a specific time window that isn't what's computed. Fixed the display text
+only (to "Opeenvolgende fouten" / "opeenvolgende fout(en)" — "consecutive
+errors") without touching the DTO field name itself: renaming the actual
+`DataSourceStatus.error_count_last_hour` field is a contract-level change
+(touches `dto.py`, every builder-core call site, `NOTES`, tests) and a
+real future improvement (a true windowed count) is already on record as
+the underlying fix — this pass only corrects what a viewer is told about a
+number that isn't changing.
+
+**Cost:** none functionally; (b) and (c) are both display-only frontend
+changes, no DTO/contract change, no test regression (no JS test harness
+exists for this frontend, per the same limitation Round 1 finding #4
+noted — verified manually via a constructed fixture and Playwright
+screenshots instead, described in `REVIEW.md`).
