@@ -305,3 +305,135 @@ per symbol (a single symbol's newly-closed bar doesn't force recomputing
 every other symbol), and correctness-equivalent; it should only be reached
 for if the real measurement above shows the per-symbol design actually
 misses the 90s budget.
+
+## 7. red-team Round 1 fixes: non-blocking startup, and weekend-horizon calibration scoring
+
+Two follow-ups after red-team's Round 1 review (`REVIEW.md`), both in
+builder-core's scope.
+
+**a. `__main__.py` no longer runs backfill/model-load synchronously before
+`uvicorn.run`.** Finding #1 (blocker): the previous version called
+`run_full_backfill(...)` then `load_predictor(...)` directly in `main()`,
+with no timeout and no `try`/`except`, before the FastAPI app object even
+existed - a fully-down network could block for tens of minutes (18
+`(instrument, timeframe)` pairs × up to ~100s of retry/backoff each) and
+then crash the process outright when `CcxtFetchError`/`YfFetchError`
+propagated out uncaught.
+
+**Decision:** `uvicorn.run(...)` now starts immediately; backfill, model
+load, and starting the scheduler happen in a background thread
+(`kmd.scheduler.run_startup_sequence`, called from `__main__.main()`)
+that retries the WHOLE sequence indefinitely on any failure, updating a
+new `kmd.api.ReadinessState` at each stage (`starting` ->
+`backfilling` -> `loading_model` -> `ok`, or `error` with the exception
+message on a failed attempt) rather than ever raising out of the thread.
+`/healthz` reads that state directly (a pure in-memory read, no I/O) so
+it responds in milliseconds regardless of what the background thread is
+doing.
+
+**Alternatives considered:**
+- Add a timeout to backfill/model-load and fail `main()` fast instead of
+  looping forever. Rejected as the top-level default: a cold start during
+  a transient network blip should self-heal once connectivity returns,
+  not require a manual process restart. (A bounded `max_attempts` is
+  still supported and used by tests for determinism/speed — production
+  just doesn't set it.)
+- Run backfill/model-load as the scheduler's own first cron tick instead
+  of a dedicated startup thread. Rejected: the scheduler's jobs are
+  timeframe-refresh-shaped (ingest a bit, forecast, done) and firing them
+  before the scheduler itself has even started would need its own
+  separate bootstrapping anyway; a plain background thread that owns
+  "backfill once, then hand off to the scheduler" is simpler to reason
+  about and test in isolation (`run_startup_sequence` takes injected
+  `backfill_fn`/`load_predictor_fn`/`start_scheduler_fn` and is tested
+  with fakes that sleep and raise, including one real-thread test that
+  asserts `/healthz` stays fast throughout).
+- Make `/healthz` return a non-200 status while not ready (e.g. 503, like
+  `/api/snapshot` already correctly does when no snapshot exists).
+  Considered but not required by the finding — the blocker was
+  *reachability*, not status-code semantics, and a liveness probe that
+  returns non-200 during a long, expected cold start can trigger
+  container-orchestrator restarts that make a slow-but-progressing
+  startup worse, not better. `/healthz` always returns `200` with a
+  `{"status", "ready", "detail"}` body; a caller that wants "ready to
+  serve real data" should check `ready`, not the HTTP status.
+
+**Cost:** `main()` no longer fails fast on a permanently-misconfigured
+environment (e.g. a typo'd model name) - it retries forever, logging the
+same error every `retry_delay_s` (default 30s). Accepted: `/healthz`'s
+`error`/`detail` fields make a stuck deployment immediately diagnosable
+from the outside, which is strictly better than the previous behavior
+(no diagnosis possible, because the process had already crashed with
+nothing listening).
+
+**b. FX/metals forecasts whose horizon lands inside a closed weekly
+session now resolve against the first bar once trading resumes, instead
+of never resolving at all.** Finding #3 (major): `forecast/engine.py`
+computes `horizon_ts` by pure bar-count arithmetic
+(`last_closed_ts + timeframe_delta * pred_len`) with no session
+awareness; for EUR/USD, USD/JPY, GOUD, ZILVER, roughly the last
+`pred_len` hours of trading before the weekly close produce a
+`horizon_ts` that lands inside the closed weekend window, where a bar can
+structurally never exist. The original `score_matured_forecasts` required
+an EXACT `ts_utc == horizon_ts` match, so those forecasts sat in
+`forecast_log` unscored forever, rescanned every refresh cycle, and were
+silently excluded from `CalibrationStats` — a systematic sampling bias in
+exactly the numbers the dashboard presents as its trust signal.
+
+**Decision (option (a) from red-team's suggested fixes, not (b)):**
+`calibration/score.py::score_matured_forecasts` now scores against the
+FIRST `is_closed=True` bar at-or-after `horizon_ts` (and at-or-before the
+caller's `now`, preserving the look-ahead invariant exactly), within a
+bounded `MAX_HORIZON_CATCHUP` (3 days, matching `quality.py`'s own
+`_WEEKEND_ALLOWANCE_S`). If no such bar arrives before that window fully
+elapses, the row is marked `unscorable`
+(`CalibrationLogger.mark_unscorable`, new `unscorable_at_utc`/
+`unscorable_reason` columns, additive schema migration for pre-existing
+`forecast_log` files) and excluded from `get_unscored_matured` going
+forward — bounding the previously-unbounded scan cost, without silently
+pretending the gap never happened (the row and its reason stay on disk,
+just out of the pending-scan set).
+
+**Alternatives considered:**
+- (b) Teach `forecast/engine.py`/`snapshot.py` session-awareness: detect
+  via `is_market_open` that a computed `horizon_ts` would land inside a
+  closed session and extend `y_timestamps` to the next in-session bar
+  before ever calling Kronos. Rejected as the primary fix: it couples the
+  forecast engine (which today has zero session/calendar knowledge, by
+  design — see `NOTES/kronos_api.md`, Kronos itself is timezone/session
+  agnostic) to `kmd.data.sessions`, changes what "24h-ahead" or
+  "`pred_len`-bars-ahead" actually means for those four instruments
+  (the model would be asked to predict a *different* number of real
+  elapsed hours than `pred_len` on weeks where the horizon would
+  otherwise cross a closure), and would need the SAME session logic
+  duplicated or shared between the forecast side and the (still
+  necessary) scoring side. Scoring-side resolution needs no such
+  coupling: the model still forecasts exactly `pred_len` bars ahead as
+  configured; only "what counts as the realized outcome for that nominal
+  instant" changes, and only in the one place (`score.py`) that already
+  owns that decision.
+- Score against the exact next `is_market_open`-computed session-open bar
+  specifically (rather than "first closed bar at-or-after horizon,
+  bounded"). Rejected as unnecessary extra coupling to `kmd.data.sessions`
+  for the same outcome: "first real bar after horizon" and "first bar
+  after the session reopens" are the same bar in practice for these
+  instruments (no bar exists in between, by construction — the market is
+  closed), so the simpler, session-agnostic version was chosen.
+- Leave `get_unscored_matured` unbounded and only fix the resolution
+  logic. Rejected: red-team specifically flagged the unbounded-scan-cost
+  half of finding #3 as well ("`get_unscored_matured` should also gain a
+  way to mark a row permanently unscorable"), and a genuine multi-day
+  data-source outage (not just a weekly close) would otherwise still
+  accumulate forever.
+
+**Cost:** the "realized outcome" for a weekend-adjacent forecast is now
+"the first traded price once the market reopened" rather than "the price
+at exactly `pred_len` hours later" — a small, disclosed definitional
+shift (documented here and in `score.py`'s docstring) that trades perfect
+temporal precision for actually being able to measure calibration on 100%
+of forecasts instead of ~80%, which is the more important property for a
+trust signal. `MAX_HORIZON_CATCHUP=3 days` is a judgment call, not a
+value derived from the data; a real multi-week exchange holiday could
+still exceed it, in which case the affected forecasts are correctly
+marked unscorable rather than incorrectly scored against an unrelated
+much-later bar.

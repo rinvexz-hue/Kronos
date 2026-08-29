@@ -17,7 +17,26 @@ until backfill AND the Kronos model finish loading — synchronously, with
 no timeout, no partial-failure handling, and no "not ready yet" response
 in between.**
 
-Confirmed by tracing `src/kmd/__main__.py::main()` line by line:
+> **Status: fixed by builder-core**, per the manager's dispatch after this
+> round. `__main__.py::main()` now starts `uvicorn.run(...)` immediately;
+> backfill, model load, and starting the scheduler run in a background
+> thread (`kmd.scheduler.run_startup_sequence`) that retries the whole
+> sequence indefinitely on any failure (never raises out of the thread)
+> and updates a new `kmd.api.ReadinessState` at each stage. `/healthz`
+> reads that state directly — a pure in-memory read — so it responds in
+> milliseconds regardless of backfill/model-load progress or failure.
+> `tests/unit/test_scheduler.py::test_healthz_responds_immediately_while_
+> startup_is_slow_and_failing` runs this in a real background thread
+> against a backfill that sleeps and a predictor loader that raises once
+> then succeeds, polling `/healthz` throughout and asserting every
+> response stays under 200ms. See `DECISIONS.md` #7a for the alternatives
+> considered (bounded retries, a non-200 `/healthz` status while not
+> ready) and why they were rejected. Not independently re-verified by
+> red-team yet — that re-verification is Round 2's job, not a
+> self-certification here.
+
+Confirmed by tracing `src/kmd/__main__.py::main()` line by line (as it
+stood at review time — see the fix note above for the current shape):
 
 ```python
 run_full_backfill(markets_config, registry, store)      # network I/O, all instruments
@@ -105,7 +124,34 @@ a bar can never exist at that exact timestamp, so the forecast can never
 be scored. It accumulates in `forecast_log` forever and is re-scanned on
 every refresh cycle.**
 
-Traced end-to-end, not assumed:
+> **Status: fixed by builder-core**, per the manager's dispatch after this
+> round, using suggested fix (a) below (score against the first available
+> bar, not an exact match) rather than (b). `calibration/score.py::
+> score_matured_forecasts` now resolves a matured forecast against the
+> first `is_closed=True` bar at-or-after `horizon_ts` (still at-or-before
+> `now`, preserving the look-ahead invariant), within a new
+> `MAX_HORIZON_CATCHUP` (3 days, matching `quality.py`'s own weekend-gap
+> allowance). A forecast still unresolved once that window fully elapses
+> is marked `unscorable` (new `CalibrationLogger.mark_unscorable`,
+> `unscorable_at_utc`/`unscorable_reason` columns, additive migration for
+> existing `forecast_log` files) and excluded from `get_unscored_matured`
+> going forward, which also closes the unbounded-scan-cost half of this
+> finding. Regression test:
+> `tests/unit/calibration/test_score.py::test_score_matured_forecasts_
+> resolves_weekend_horizon_against_first_reopen_bar` constructs an
+> EUR/USD forecast whose horizon lands on a Saturday (inside the `fx`
+> session's Friday-22:00-to-Sunday-22:00-UTC closure) and asserts it
+> resolves against the Sunday-evening reopen bar rather than staying
+> pending forever; a second test
+> (`test_score_matured_forecasts_marks_unscorable_after_catchup_window_
+> elapses`) covers the genuine-outage case. See `DECISIONS.md` #7b for why
+> (a) was chosen over (b) and the cost this trades away (temporal
+> precision of "realized outcome" for weekend-adjacent forecasts, in
+> exchange for actually being able to score them). Not independently
+> re-verified by red-team yet.
+
+Traced end-to-end, not assumed (as of review time — see the fix note
+above for the current behavior):
 - `config/markets.yaml`'s `fx` session: open Sun 22:00 UTC, closed Fri
   22:00 → Sun 22:00 UTC (a 48h weekly closure). `metals_futures` is
   similar (Sun 23:00 America/Chicago → Fri 22:00 America/Chicago).
@@ -397,6 +443,22 @@ directly this round. Round 1 is otherwise a clean pass on look-ahead bias,
 timezone/DST handling, calibration math, data-integrity adversarial
 testing, float precision, and security — each explicitly checked and
 recorded above, not asserted by omission.
+
+### Post-Round-1 builder-core follow-up (not a red-team self-certification)
+
+Findings #1 and #3 above were dispatched to builder-core after this round
+and are now marked fixed inline (see the status notes on each finding and
+`DECISIONS.md` #7a/#7b). `ruff check .`, `python -m mypy`, and
+`python -m pytest tests -q` all pass after both changes (187 passed, 1
+deselected). Finding #2 (no README) remains open — out of builder-core's
+scope, tracked separately. **These fixes are builder-core's own report,
+not a red-team re-verification** — the checkboxes below and the sign-off
+statement stay exactly as red-team left them until Round 2 (or a
+dedicated re-check) actually confirms the fixes hold up, including under
+fault injection (e.g. does the startup thread actually recover if the
+network comes back mid-backoff; does a real weekend gap in a fixture
+resolve the way the new regression test claims against the real
+`SqliteStore`, not just `FakeMarketStore`).
 
 ## Round 2 — robustness (fault injection)
 
