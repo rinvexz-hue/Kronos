@@ -167,3 +167,80 @@ def test_build_snapshot_excludes_context_group_even_with_full_history(tmp_path: 
 
     symbols = {a.display_symbol for a in dto.assets}
     assert symbols == {"BTC/USDT"}
+
+
+class _NanForOneSymbolPredictor:
+    """A `PredictorProtocol` double that produces NaN close paths for the
+    FIRST instrument `build_snapshot` forecasts (BTC/USDT, per
+    `_markets_config`'s instrument order) and ordinary finite paths for
+    every instrument after that (XRP/USDT) - simulating a genuinely
+    unstable model output (or a poisoned input) affecting exactly one
+    instrument, independent of any upstream data-layer NaN guard.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def predict_batch(self, df_list, x_timestamp_list, y_timestamp_list, pred_len, **kwargs):  # type: ignore[no-untyped-def]
+        import numpy as np
+        import pandas as pd
+
+        poisoned = self.calls == 0
+        self.calls += 1
+
+        results = []
+        for df, y_timestamp in zip(df_list, y_timestamp_list, strict=True):
+            last_close = float(df["close"].iloc[-1])
+            closes = np.full(pred_len, float("nan")) if poisoned else np.full(pred_len, last_close)
+            results.append(
+                pd.DataFrame(
+                    {
+                        "open": closes,
+                        "high": closes,
+                        "low": closes,
+                        "close": closes,
+                        "volume": np.zeros(pred_len),
+                        "amount": np.zeros(pred_len),
+                    },
+                    index=pd.Index(y_timestamp),
+                )
+            )
+        return results
+
+
+def test_build_snapshot_isolates_one_instrument_whose_forecast_comes_back_nan(
+    tmp_path: Path,
+) -> None:
+    """Red-team Round 2 (fault injection): a NaN forecast for one
+    instrument (BTC/USDT here) must not corrupt or block the snapshot for
+    every other instrument (XRP/USDT) - `ForecastMetrics.must_be_finite`
+    raises inside `_get_or_compute_forecast`, which `build_snapshot`'s
+    existing per-instrument `try/except` catches exactly like an
+    `InsufficientDataError`. Also proves the resulting `SnapshotDTO`
+    (containing only the healthy instrument) round-trips through pydantic
+    JSON cleanly - the corrupted instrument never reaches the DTO at all,
+    rather than reaching it and breaking the whole document.
+    """
+    store = FakeMarketStore()
+    store.set_bars("BTC/USDT", Timeframe.H1, _closed_bars("BTC/USDT", LOOKBACK + 5))
+    store.set_bars("XRP/USDT", Timeframe.H1, _closed_bars("XRP/USDT", LOOKBACK + 5, start_price=0.5))
+
+    forecast_cache = ForecastCache(tmp_path / "forecast.sqlite3")
+    calibration_logger = CalibrationLogger(tmp_path / "forecast.sqlite3")
+    dto = build_snapshot(
+        store=store,
+        markets_config=_markets_config(),
+        settings=Settings(mc_paths=5),
+        predictor=_NanForOneSymbolPredictor(),
+        forecast_cache=forecast_cache,
+        calibration_logger=calibration_logger,
+        timeframe=Timeframe.H1,
+        now=BASE_TS + timedelta(hours=LOOKBACK + 1),
+    )
+
+    symbols = {a.display_symbol for a in dto.assets}
+    assert symbols == {"XRP/USDT"}  # BTC/USDT (NaN forecast) skipped, not crashed
+
+    raw_json = dto.model_dump_json()
+    round_tripped = SnapshotDTO.model_validate_json(raw_json)
+    assert round_tripped == dto

@@ -35,6 +35,7 @@ from kmd.forecast.cache import ForecastCache
 from kmd.scheduler import (
     PRIMARY_TIMEFRAME,
     build_ingest_fn,
+    build_scheduler,
     run_refresh_cycle,
     run_startup_sequence,
 )
@@ -342,6 +343,58 @@ def test_run_startup_sequence_gives_up_after_max_attempts_without_raising() -> N
     assert calls["n"] == 3
     assert readiness.snapshot()["ready"] is False
     assert readiness.snapshot()["status"] == "error"
+
+
+def test_build_scheduler_logs_a_missed_job_instead_of_silently_dropping_it(
+    tmp_path: Path, caplog
+) -> None:  # type: ignore[no-untyped-def]
+    """Red-team Round 2 (fault injection, clock jump): APScheduler's own
+    defaults (`misfire_grace_time=1s`, `coalesce=True`) silently drop a
+    refresh tick that becomes due more than ~1s late - exactly what a
+    forward system-clock jump (or the previous cycle overrunning into the
+    next one) produces. Confirmed here for real, against a real
+    `BackgroundScheduler` with a job whose due time is already in the past
+    by more than the grace period, not just by reading the APScheduler
+    source: without a listener, this is entirely invisible; `build_scheduler`
+    now logs it as a warning.
+    """
+    import logging
+
+    from apscheduler.triggers.date import DateTrigger
+
+    store = _store_with_history()
+    scheduler = build_scheduler(
+        store=store,
+        markets_config=_markets_config(),
+        settings=Settings(mc_paths=3, refresh_timeframes="1h"),
+        predictor=FakePredictor(),
+        forecast_cache=ForecastCache(tmp_path / "forecast.sqlite3"),
+        calibration_logger=CalibrationLogger(tmp_path / "forecast.sqlite3"),
+        snapshot_sink=lambda _dto: None,
+        ingest_fn=lambda _tf: None,
+    )
+    # A one-off job whose scheduled time is already 10s in the past -
+    # simulating what a job's `next_run_time` looks like right after a
+    # multi-second-or-more forward clock jump, from the scheduler's own
+    # (default 1s) misfire-grace-time perspective.
+    scheduler.add_job(
+        lambda: None,
+        trigger=DateTrigger(run_date=datetime.now(UTC) - timedelta(seconds=10)),
+        id="simulated_missed_tick",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="kmd.scheduler"):
+        scheduler.start()
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if any("missed its run time" in r.message for r in caplog.records):
+                break
+            time.sleep(0.05)
+        scheduler.shutdown(wait=False)
+
+    assert any("missed its run time" in r.message for r in caplog.records), (
+        "expected the missed job to be logged, not silently dropped"
+    )
 
 
 def test_healthz_responds_immediately_while_startup_is_slow_and_failing(tmp_path: Path) -> None:
