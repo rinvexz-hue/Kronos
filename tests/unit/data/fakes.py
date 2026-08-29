@@ -57,7 +57,7 @@ class FakeCcxtExchange:
         self,
         rows: list[list[float]],
         *,
-        id: str = "fakeexchange",  # noqa: A002 - mirrors ccxt.Exchange's own attribute name
+        id: str = "fakeexchange",
         fail_next: int = 0,
         failure: Callable[[], Exception] = lambda: RuntimeError("simulated fetch failure"),
     ) -> None:
