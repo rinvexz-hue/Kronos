@@ -48,9 +48,16 @@ class Bar(BaseModel):
     @field_validator("ts_utc")
     @classmethod
     def must_be_utc_aware(cls, v: datetime) -> datetime:
-        if v.tzinfo is None or v.utcoffset() is None:
+        # NOTE (builder-data): reads `utcoffset()` once into a local instead
+        # of calling it a second time on the next line. Behavior is
+        # unchanged; this only lets mypy --strict narrow the `None` case
+        # instead of seeing a second, distinct `timedelta | None` call it
+        # can't prove non-None. See DECISIONS.md for why this contract file
+        # was touched.
+        offset = v.utcoffset()
+        if v.tzinfo is None or offset is None:
             raise ValueError("Bar.ts_utc must be timezone-aware")
-        if v.utcoffset().total_seconds() != 0:
+        if offset.total_seconds() != 0:
             raise ValueError("Bar.ts_utc must be normalized to UTC (offset must be 0)")
         return v
 
