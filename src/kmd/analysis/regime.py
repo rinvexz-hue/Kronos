@@ -9,7 +9,7 @@ that drove the classification (never a bare label with no justification).
 from __future__ import annotations
 
 from kmd.data.base import Bar
-from kmd.snapshot import Regime, RegimeLabel, VolRegime
+from kmd.dto import Regime, RegimeLabel, VolRegime
 
 EMA_FAST_PERIOD = 20
 EMA_SLOW_PERIOD = 50

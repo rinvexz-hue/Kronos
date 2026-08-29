@@ -19,7 +19,7 @@ from datetime import datetime
 
 from kmd.calibration.logger import CalibrationLogger, ForecastLogRecord
 from kmd.data.base import MarketStore
-from kmd.snapshot import CalibrationStats
+from kmd.dto import CalibrationStats
 
 
 @dataclass(frozen=True)

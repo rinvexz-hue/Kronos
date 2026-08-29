@@ -10,7 +10,7 @@ already-computed `ForecastMetrics` and `Level`/`Regime` DTOs).
 
 from __future__ import annotations
 
-from kmd.snapshot import ForecastMetrics, Level, Regime, SetupCard
+from kmd.dto import ForecastMetrics, Level, Regime, SetupCard
 
 
 def _nearest_support_below(levels: list[Level], price: float) -> float | None:

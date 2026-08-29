@@ -1,15 +1,16 @@
-"""The single DTO that feeds the entire dashboard. `GET /api/snapshot`
-returns exactly `SnapshotDTO.model_dump(mode="json")`; the frontend reads
-nothing else. This module defines the contract shape; `build_snapshot()`
-is builder-core's implementation, assembled from the forecast/analysis/
-calibration layers plus data-source status — it must never call into the
-data layer's source adapters or SQLite schema directly, only through
-`kmd.data.base.MarketStore` and the forecast/analysis modules.
+"""Assembly of the dashboard's `SnapshotDTO`. The DTO shapes themselves
+live in `kmd.dto` (re-exported below, so `from kmd.snapshot import
+SnapshotDTO` etc. keeps working) — they were split out of this module so
+`kmd.analysis.*` (regime/levels/setup) can depend on the shapes without
+importing `kmd.snapshot` itself, which would be circular since this
+module imports `kmd.analysis.*`.
 
-Every field that could be mistaken for a live guarantee for a viewer
-either carries its own provenance (e.g. `Level.reason`) or is paired with
-a status field showing why it might not be trustworthy right now (e.g.
-`DataSourceStatus.is_stale`, `CalibrationStats.sufficient_data`).
+`GET /api/snapshot` returns exactly `SnapshotDTO.model_dump(mode="json")`;
+the frontend reads nothing else. `build_snapshot()` is builder-core's
+implementation, assembled from the forecast/analysis/calibration layers
+plus data-source status — it must never call into the data layer's source
+adapters or SQLite schema directly, only through `kmd.data.base.MarketStore`
+and the forecast/analysis modules.
 """
 
 from __future__ import annotations
@@ -17,9 +18,6 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import UTC, datetime
-from typing import Literal
-
-from pydantic import BaseModel
 
 from kmd.analysis.levels import compute_levels
 from kmd.analysis.regime import compute_regime
@@ -30,9 +28,39 @@ from kmd.config import Settings
 from kmd.data.base import Bar, MarketStore, SourceHealth, Timeframe
 from kmd.data.markets_config import Instrument, MarketsConfig
 from kmd.data.sessions import is_market_open
+from kmd.dto import (
+    AssetSnapshot,
+    CalibrationStats,
+    DataSourceStatus,
+    ForecastMetrics,
+    Level,
+    LevelKind,
+    Regime,
+    RegimeLabel,
+    SetupCard,
+    SnapshotDTO,
+    VolRegime,
+)
 from kmd.forecast import metrics as fmetrics
 from kmd.forecast.cache import ForecastCache, ForecastCacheKey, result_to_cached
 from kmd.forecast.engine import TIMEFRAME_DELTAS, PredictorProtocol, run_monte_carlo
+
+__all__ = [
+    "AssetSnapshot",
+    "CalibrationStats",
+    "DataSourceStatus",
+    "ForecastMetrics",
+    "InsufficientDataError",
+    "Level",
+    "LevelKind",
+    "Regime",
+    "RegimeLabel",
+    "SetupCard",
+    "SnapshotDTO",
+    "VolRegime",
+    "build_asset_snapshot",
+    "build_snapshot",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -43,83 +71,6 @@ logger = logging.getLogger(__name__)
 # this (it is a builder-core presentation rule, not a data-layer one), so
 # it is filtered on here by group name.
 _CONTEXT_GROUP = "context"
-
-RegimeLabel = Literal["trend_up", "trend_down", "range", "unknown"]
-VolRegime = Literal["low", "normal", "high"]
-LevelKind = Literal["swing_high", "swing_low", "pdh", "pdl", "ma_cluster", "round_number"]
-
-
-class Regime(BaseModel):
-    label: RegimeLabel
-    vol_regime: VolRegime
-    reason: str
-
-
-class Level(BaseModel):
-    price: float
-    kind: LevelKind
-    reason: str
-
-
-class ForecastMetrics(BaseModel):
-    p_up_24h: float
-    q10: float
-    q50: float
-    q90: float
-    p_vol_expansion: float
-    band_width_pct: float
-    n_paths: int
-    model_name: str
-    generated_at_utc: datetime
-    last_closed_bar_ts_utc: datetime
-
-
-class CalibrationStats(BaseModel):
-    n_observations: int
-    brier_score: float | None
-    mae_q50: float | None
-    band_coverage: float | None
-    sufficient_data: bool
-
-
-class SetupCard(BaseModel):
-    direction: Literal["long", "short"]
-    entry: float
-    invalidation: float
-    target: float
-    rr: float
-    risk_pct: float
-
-
-class DataSourceStatus(BaseModel):
-    source_name: str
-    last_update_utc: datetime | None
-    is_stale: bool
-    error_count_last_hour: int
-    market_session_open: bool | None
-
-
-class AssetSnapshot(BaseModel):
-    display_symbol: str
-    group: str
-    decimals: int
-    price: float
-    change_1h_pct: float | None
-    change_24h_pct: float | None
-    change_7d_pct: float | None
-    sparkline: list[float]
-    regime: Regime
-    levels: list[Level]
-    forecast: ForecastMetrics
-    calibration: CalibrationStats
-    setup: SetupCard | None
-    source_status: DataSourceStatus
-
-
-class SnapshotDTO(BaseModel):
-    generated_at_utc: datetime
-    correlation_id: str
-    assets: list[AssetSnapshot]
 
 
 class InsufficientDataError(ValueError):

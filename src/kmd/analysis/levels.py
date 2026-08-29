@@ -13,7 +13,7 @@ import math
 from datetime import date
 
 from kmd.data.base import Bar
-from kmd.snapshot import Level
+from kmd.dto import Level
 
 SWING_WINDOW = 3  # bars on each side that must be lower/higher for a swing point
 SWING_LOOKBACK_BARS = 120  # only look for swings within this many recent closed bars
