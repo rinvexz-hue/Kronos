@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Kronos Market Desk</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-title">
+      <span class="dot" aria-hidden="true"></span>
+      Kronos Market Desk
+    </div>
+    <div class="topbar-meta">
+      <span id="generated-at">—</span>
+    </div>
+  </header>
+
+  <div id="status-bar" class="status-bar" aria-label="Databron status"></div>
+
+  <main id="app">
+    <section id="grid-view" class="grid-view">
+      <div id="tile-grid" class="tile-grid"></div>
+      <p id="empty-state" class="empty-state" hidden>
+        Nog geen data beschikbaar. De achtergrondtaak moet nog een eerste verversing voltooien.
+      </p>
+      <p id="error-state" class="error-state" hidden></p>
+    </section>
+
+    <section id="detail-view" class="detail-view" hidden>
+      <button id="back-button" class="back-button" type="button">&larr; Terug naar overzicht</button>
+      <div id="detail-content"></div>
+    </section>
+  </main>
+
+  <footer class="disclaimer">
+    Uitsluitend marktobservatie — geen orderuitvoering, geen beleggingsadvies. Alle kansen zijn
+    modeluitkomsten met onzekerheid; zie kalibratiestatistieken per instrument.
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>
