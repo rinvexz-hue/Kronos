@@ -7,9 +7,14 @@ reimplemented) to a concrete store.
 
 from __future__ import annotations
 
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from fastapi.testclient import TestClient
+
+from kmd.api import ReadinessState, create_app
 from kmd.calibration.logger import CalibrationLogger
 from kmd.config import Settings
 from kmd.data.base import Bar, SourceHealth, Timeframe
@@ -27,7 +32,12 @@ from kmd.data.markets_config import (
 )
 from kmd.data.store import SqliteStore
 from kmd.forecast.cache import ForecastCache
-from kmd.scheduler import PRIMARY_TIMEFRAME, build_ingest_fn, run_refresh_cycle
+from kmd.scheduler import (
+    PRIMARY_TIMEFRAME,
+    build_ingest_fn,
+    run_refresh_cycle,
+    run_startup_sequence,
+)
 from kmd.snapshot import SnapshotDTO
 from tests.support import FakeMarketStore, FakePredictor, make_bar
 
@@ -211,3 +221,184 @@ def test_build_ingest_fn_wraps_real_ingest_module(tmp_path: Path) -> None:
     assert source.fetch_calls == 1
     stored = store.get_latest_bars("BTC/USDT", Timeframe.H1, 10)
     assert len(stored) == 5
+
+
+class _RecordingReadiness(ReadinessState):
+    """Records every `update()` call (in order) in addition to the normal
+    `ReadinessState` behaviour, so tests can assert the exact sequence of
+    states `run_startup_sequence` reports, not just the final one.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.history: list[dict[str, object]] = []
+
+    def update(self, *, status: str, ready: bool, detail: str | None = None) -> None:
+        self.history.append({"status": status, "ready": ready, "detail": detail})
+        super().update(status=status, ready=ready, detail=detail)
+
+
+def test_run_startup_sequence_happy_path_reaches_ready() -> None:
+    readiness = _RecordingReadiness()
+    backfill_calls = []
+    started_with = []
+
+    def backfill_fn() -> None:
+        backfill_calls.append(1)
+
+    def load_predictor_fn() -> object:
+        return "fake-predictor"
+
+    def start_scheduler_fn(predictor: object) -> None:
+        started_with.append(predictor)
+
+    run_startup_sequence(
+        readiness=readiness,
+        backfill_fn=backfill_fn,
+        load_predictor_fn=load_predictor_fn,  # type: ignore[arg-type]
+        start_scheduler_fn=start_scheduler_fn,  # type: ignore[arg-type]
+        sleep_fn=lambda _s: None,
+    )
+
+    assert backfill_calls == [1]
+    assert started_with == ["fake-predictor"]
+    assert readiness.snapshot() == {"status": "ok", "ready": True, "detail": None}
+    statuses = [h["status"] for h in readiness.history]
+    assert statuses == ["backfilling", "loading_model", "ok"]
+
+
+def test_run_startup_sequence_never_raises_on_backfill_failure_and_retries() -> None:
+    """A failing backfill (network down) must never propagate out of
+    `run_startup_sequence` - it retries the whole sequence instead."""
+    readiness = _RecordingReadiness()
+    attempts = {"n": 0}
+
+    def flaky_backfill_fn() -> None:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise ConnectionError("network is down")
+
+    run_startup_sequence(
+        readiness=readiness,
+        backfill_fn=flaky_backfill_fn,
+        load_predictor_fn=lambda: "fake-predictor",
+        start_scheduler_fn=lambda _predictor: None,
+        max_attempts=5,
+        sleep_fn=lambda _s: None,  # never actually sleeps in the test
+    )
+
+    assert attempts["n"] == 2  # failed once, succeeded on retry
+    assert readiness.snapshot()["ready"] is True
+    statuses = [h["status"] for h in readiness.history]
+    assert "error" in statuses  # the failed attempt was genuinely reported
+    assert statuses[-1] == "ok"
+    # the failed attempt's error detail was the real exception message
+    error_entries = [h for h in readiness.history if h["status"] == "error"]
+    assert error_entries[0]["detail"] == "network is down"
+
+
+def test_run_startup_sequence_never_raises_on_predictor_load_failure() -> None:
+    """Same guarantee, this time for a slow/broken Hugging Face download
+    (`load_predictor_fn` raising) rather than backfill."""
+    readiness = _RecordingReadiness()
+
+    def always_failing_load_predictor_fn() -> object:
+        raise RuntimeError("could not reach huggingface.co")
+
+    run_startup_sequence(
+        readiness=readiness,
+        backfill_fn=lambda: None,
+        load_predictor_fn=always_failing_load_predictor_fn,  # type: ignore[arg-type]
+        start_scheduler_fn=lambda _predictor: None,
+        max_attempts=3,
+        sleep_fn=lambda _s: None,
+    )
+
+    assert readiness.snapshot() == {
+        "status": "error",
+        "ready": False,
+        "detail": "could not reach huggingface.co",
+    }
+
+
+def test_run_startup_sequence_gives_up_after_max_attempts_without_raising() -> None:
+    readiness = _RecordingReadiness()
+    calls = {"n": 0}
+
+    def always_failing_backfill_fn() -> None:
+        calls["n"] += 1
+        raise ConnectionError("still down")
+
+    # Must not raise even though every attempt fails.
+    run_startup_sequence(
+        readiness=readiness,
+        backfill_fn=always_failing_backfill_fn,
+        load_predictor_fn=lambda: "unreachable",
+        start_scheduler_fn=lambda _predictor: None,
+        max_attempts=3,
+        sleep_fn=lambda _s: None,
+    )
+
+    assert calls["n"] == 3
+    assert readiness.snapshot()["ready"] is False
+    assert readiness.snapshot()["status"] == "error"
+
+
+def test_healthz_responds_immediately_while_startup_is_slow_and_failing(tmp_path: Path) -> None:
+    """The actual regression test for red-team finding #1: a real
+    background thread runs `run_startup_sequence` against a backfill_fn
+    that sleeps for real (simulating a slow network) and a
+    load_predictor_fn that raises (simulating an unreachable Hugging
+    Face) before eventually succeeding - and `/healthz`, served by a
+    FastAPI app sharing the same `ReadinessState`, must respond in
+    milliseconds throughout, never blocking on either.
+    """
+    readiness = ReadinessState()
+    client = TestClient(create_app(lambda: None, web_dir=tmp_path, readiness=readiness))
+
+    predictor_attempts = {"n": 0}
+
+    def slow_backfill_fn() -> None:
+        time.sleep(0.3)  # simulates a slow (but eventually successful) network
+
+    def flaky_slow_load_predictor_fn() -> object:
+        predictor_attempts["n"] += 1
+        if predictor_attempts["n"] == 1:
+            raise RuntimeError("huggingface.co unreachable")
+        time.sleep(0.2)
+        return "fake-predictor"
+
+    thread = threading.Thread(
+        target=run_startup_sequence,
+        kwargs={
+            "readiness": readiness,
+            "backfill_fn": slow_backfill_fn,
+            "load_predictor_fn": flaky_slow_load_predictor_fn,
+            "start_scheduler_fn": lambda _predictor: None,
+            "retry_delay_s": 0.05,
+            "sleep_fn": time.sleep,
+        },
+        daemon=True,
+    )
+    thread.start()
+
+    # Poll /healthz repeatedly while the background thread is definitely
+    # still working (it needs at least ~0.3s + a retry to finish) - every
+    # single call must return fast and never 5xx/hang.
+    saw_not_ready = False
+    deadline = time.monotonic() + 2.0
+    while thread.is_alive() and time.monotonic() < deadline:
+        start = time.monotonic()
+        resp = client.get("/healthz")
+        elapsed = time.monotonic() - start
+        assert resp.status_code == 200
+        assert elapsed < 0.2, f"/healthz took {elapsed:.3f}s while startup was in progress"
+        if resp.json()["ready"] is False:
+            saw_not_ready = True
+        time.sleep(0.02)
+
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+    assert saw_not_ready  # actually observed the in-progress state, not just the end
+    final = client.get("/healthz").json()
+    assert final == {"status": "ok", "ready": True, "detail": None}

@@ -17,6 +17,7 @@ for the next scheduled refresh.
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -29,6 +30,34 @@ from kmd.snapshot import SnapshotDTO
 WEB_DIR = REPO_ROOT / "web"
 
 SnapshotProvider = Callable[[], SnapshotDTO | None]
+
+
+class ReadinessState:
+    """Thread-safe startup-readiness flag `/healthz` reports.
+
+    `__main__.py` runs backfill + Kronos model loading in a background
+    thread (see `kmd.scheduler.run_startup_sequence`) precisely so those
+    can be slow, retried, or fail without ever blocking the API from
+    serving — this is the object that background thread updates and the
+    (separate) request-handling thread(s) read, hence the lock: a health
+    check must never observe a torn read across `status`/`ready`/`detail`.
+    """
+
+    def __init__(self, *, status: str = "starting", ready: bool = False) -> None:
+        self._lock = threading.Lock()
+        self._status = status
+        self._ready = ready
+        self._detail: str | None = None
+
+    def update(self, *, status: str, ready: bool, detail: str | None = None) -> None:
+        with self._lock:
+            self._status = status
+            self._ready = ready
+            self._detail = detail
+
+    def snapshot(self) -> dict[str, object]:
+        with self._lock:
+            return {"status": self._status, "ready": self._ready, "detail": self._detail}
 
 
 class SnapshotFileStore:
@@ -52,12 +81,30 @@ class SnapshotFileStore:
         return SnapshotDTO.model_validate(raw)
 
 
-def create_app(snapshot_provider: SnapshotProvider, web_dir: Path = WEB_DIR) -> FastAPI:
+def create_app(
+    snapshot_provider: SnapshotProvider,
+    web_dir: Path = WEB_DIR,
+    readiness: ReadinessState | None = None,
+) -> FastAPI:
+    """`readiness` defaults to an already-`ready` state — every caller that
+    doesn't care about startup sequencing (every existing test, and any
+    embedding that constructs its own scheduler/predictor eagerly before
+    calling this) keeps seeing `/healthz` report ready immediately.
+    `__main__.py` passes a real `ReadinessState` it also hands to
+    `kmd.scheduler.run_startup_sequence`, so `/healthz` reflects genuine
+    backfill/model-load progress instead.
+    """
+    if readiness is None:
+        readiness = ReadinessState(status="ok", ready=True)
+
     app = FastAPI(title="Kronos Market Desk")
 
     @app.get("/healthz")
-    def healthz() -> dict[str, str]:
-        return {"status": "ok"}
+    def healthz() -> dict[str, object]:
+        # Never touches the model, the store, or any I/O - a pure in-memory
+        # read, so this responds immediately regardless of what startup is
+        # doing concurrently in the background thread.
+        return readiness.snapshot()
 
     @app.get("/api/snapshot")
     def get_snapshot() -> dict[str, object]:

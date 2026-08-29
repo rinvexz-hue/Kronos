@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from kmd.api import SnapshotFileStore, create_app
+from kmd.api import ReadinessState, SnapshotFileStore, create_app
 from kmd.dto import (
     AssetSnapshot,
     CalibrationStats,
@@ -75,7 +75,28 @@ def test_healthz_never_needs_a_snapshot(tmp_path: Path) -> None:
     client = TestClient(create_app(lambda: None, web_dir=tmp_path))
     resp = client.get("/healthz")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+    assert resp.json() == {"status": "ok", "ready": True, "detail": None}
+
+
+def test_healthz_reflects_injected_readiness_state(tmp_path: Path) -> None:
+    readiness = ReadinessState()  # defaults to not-ready, status="starting"
+    client = TestClient(create_app(lambda: None, web_dir=tmp_path, readiness=readiness))
+
+    resp = client.get("/healthz")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "starting", "ready": False, "detail": None}
+
+    readiness.update(status="backfilling", ready=False)
+    assert client.get("/healthz").json()["status"] == "backfilling"
+
+    readiness.update(status="error", ready=False, detail="boom")
+    body = client.get("/healthz").json()
+    assert body["status"] == "error"
+    assert body["ready"] is False
+    assert body["detail"] == "boom"
+
+    readiness.update(status="ok", ready=True)
+    assert client.get("/healthz").json() == {"status": "ok", "ready": True, "detail": None}
 
 
 def test_snapshot_endpoint_returns_503_when_none_yet(tmp_path: Path) -> None:

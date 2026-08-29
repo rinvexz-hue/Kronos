@@ -17,6 +17,7 @@ asset.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
@@ -24,6 +25,7 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from kmd.api import ReadinessState
 from kmd.calibration.logger import CalibrationLogger
 from kmd.calibration.score import score_matured_forecasts
 from kmd.config import Settings
@@ -154,3 +156,59 @@ def build_scheduler(
         scheduler.add_job(_job, trigger, id=f"refresh_{timeframe.value}", replace_existing=True)
 
     return scheduler
+
+
+BackfillFn = Callable[[], None]
+LoadPredictorFn = Callable[[], PredictorProtocol]
+StartSchedulerFn = Callable[[PredictorProtocol], None]
+SleepFn = Callable[[float], None]
+
+DEFAULT_STARTUP_RETRY_DELAY_S = 30.0
+
+
+def run_startup_sequence(
+    *,
+    readiness: ReadinessState,
+    backfill_fn: BackfillFn,
+    load_predictor_fn: LoadPredictorFn,
+    start_scheduler_fn: StartSchedulerFn,
+    retry_delay_s: float = DEFAULT_STARTUP_RETRY_DELAY_S,
+    max_attempts: int | None = None,
+    sleep_fn: SleepFn = time.sleep,
+) -> None:
+    """Runs backfill -> Kronos model load -> scheduler start, updating
+    `readiness` at each stage. Intended to run in a background thread
+    (see `__main__.py`) so a slow or fully-down network during a cold
+    start never blocks `/healthz` — or anything else the API serves —
+    from responding, and never crashes the process: EVERY exception from
+    `backfill_fn`/`load_predictor_fn`/`start_scheduler_fn` is caught,
+    reported via `readiness` (`status="error"`, `detail=str(exc)`), and
+    the whole sequence is retried after `retry_delay_s` rather than
+    propagating.
+
+    `max_attempts=None` (the `__main__.py` default) retries forever - a
+    real deployment cold-starting during a network outage should keep
+    trying until it succeeds, not give up. Tests pass a small bound (and
+    a non-blocking `sleep_fn`) to keep retry-exhaustion cases fast and
+    deterministic.
+    """
+    attempt = 0
+    while max_attempts is None or attempt < max_attempts:
+        attempt += 1
+        try:
+            readiness.update(status="backfilling", ready=False)
+            backfill_fn()
+
+            readiness.update(status="loading_model", ready=False)
+            predictor = load_predictor_fn()
+
+            start_scheduler_fn(predictor)
+
+            readiness.update(status="ok", ready=True)
+            return
+        except Exception as exc:
+            logger.exception(
+                "startup sequence attempt %d failed, retrying in %.0fs", attempt, retry_delay_s
+            )
+            readiness.update(status="error", ready=False, detail=str(exc))
+            sleep_fn(retry_delay_s)
