@@ -207,10 +207,33 @@ function renderGrid(snapshot) {
 function renderStatusBar(snapshot) {
   const bar = document.getElementById("status-bar");
   bar.innerHTML = "";
+  // Several assets can share one `source_name` (e.g. every yfinance-backed
+  // instrument). This bar shows ONE chip per source, so it must aggregate
+  // conservatively across every asset using that source rather than just
+  // keeping whichever asset happened to come first in `snapshot.assets` —
+  // otherwise a genuinely stale/erroring instrument can be silently hidden
+  // behind a healthy one that happens to share the same source_name, which
+  // is exactly the "stale data shown as live" failure mode this dashboard
+  // must never produce.
   const bySource = new Map();
   for (const asset of snapshot.assets) {
     const status = asset.source_status;
-    if (!bySource.has(status.source_name)) bySource.set(status.source_name, status);
+    const existing = bySource.get(status.source_name);
+    if (!existing) {
+      bySource.set(status.source_name, { ...status });
+      continue;
+    }
+    existing.is_stale = existing.is_stale || status.is_stale;
+    existing.error_count_last_hour = Math.max(
+      existing.error_count_last_hour,
+      status.error_count_last_hour
+    );
+    if (
+      status.last_update_utc &&
+      (!existing.last_update_utc || status.last_update_utc < existing.last_update_utc)
+    ) {
+      existing.last_update_utc = status.last_update_utc;
+    }
   }
   for (const status of bySource.values()) {
     const sessionLabel =
@@ -223,7 +246,9 @@ function renderStatusBar(snapshot) {
       el("span", { class: "dot" }),
       el("span", {
         text: `${status.source_name} · ${fmtDateTime(status.last_update_utc)}${sessionLabel}${
-          status.error_count_last_hour > 0 ? ` · ${status.error_count_last_hour} fout(en)` : ""
+          status.error_count_last_hour > 0
+            ? ` · ${status.error_count_last_hour} opeenvolgende fout(en)`
+            : ""
         }`,
       }),
     ]);
@@ -439,7 +464,12 @@ function renderDetail(asset) {
       }),
     ]),
     el("div", { class: "source-row" }, [
-      el("span", { text: "Fouten (laatste uur)" }),
+      // Labeled "opeenvolgend" (consecutive), not "laatste uur" (last
+      // hour): the backend field is actually a consecutive-failures-since-
+      // last-success counter (see DECISIONS.md #5e), not a true rolling
+      // one-hour window - the old label asserted a precision the number
+      // doesn't have.
+      el("span", { text: "Opeenvolgende fouten" }),
       el("span", { text: String(status.error_count_last_hour) }),
     ]),
   ]);
