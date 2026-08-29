@@ -194,6 +194,23 @@ class YfinanceSource:
 
         try:
             frame = with_retry(_do_fetch, policy=self._backoff, sleep=self._sleep, rng=self._rng)
+            now = self._clock()
+            # Frame->Bar conversion (pydantic validation included, e.g. the
+            # NaN/Inf OHLCV guard) is inside this same try block on purpose:
+            # a malformed frame (a NaN close from a real yfinance illiquid-
+            # period response, a stray dtype issue, ...) is a failure of this
+            # fetch exactly as much as a network error is, and must be
+            # reported the same well-typed way (`YfFetchError`,
+            # breaker.on_failure) - NOT recorded as `on_success()` while
+            # silently returning a corrupted Bar, and NOT allowed to escape
+            # as a raw, unwrapped exception `_fetch_with_fallback` doesn't
+            # recognize as retryable/fallback-triggering (red-team Round 2).
+            native_bars = self._frame_to_bars(frame, source_symbol, native_timeframe, now)
+            bars = (
+                _resample_h1_to_h4(native_bars, source_symbol, now)
+                if timeframe is Timeframe.H4
+                else native_bars
+            )
         except Exception as exc:  # deliberately wraps every failure mode into YfFetchError
             self._breaker.on_failure(str(exc))
             raise YfFetchError(
@@ -201,14 +218,6 @@ class YfinanceSource:
             ) from exc
 
         self._breaker.on_success()
-        now = self._clock()
-        native_bars = self._frame_to_bars(frame, source_symbol, native_timeframe, now)
-
-        bars = (
-            _resample_h1_to_h4(native_bars, source_symbol, now)
-            if timeframe is Timeframe.H4
-            else native_bars
-        )
         if limit <= 0:
             return []
         return bars[-limit:] if limit < len(bars) else bars

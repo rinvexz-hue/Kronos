@@ -79,20 +79,6 @@ class ForecastCacheKey:
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-    @classmethod
-    def from_result(cls, result: MonteCarloResult) -> ForecastCacheKey:
-        return cls(
-            symbol=result.symbol,
-            timeframe=result.timeframe,
-            last_closed_ts=result.last_closed_ts,
-            model_name=result.model_name,
-            temperature=result.temperature,
-            top_p=result.top_p,
-            n_paths=result.n_paths,
-            lookback_bars=result.lookback_bars,
-            pred_len=result.pred_len,
-        )
-
 
 @dataclass(frozen=True)
 class CachedForecast:

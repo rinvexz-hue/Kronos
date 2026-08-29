@@ -22,6 +22,13 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
+from apscheduler.events import (
+    EVENT_JOB_ERROR,
+    EVENT_JOB_MAX_INSTANCES,
+    EVENT_JOB_MISSED,
+    JobExecutionEvent,
+    JobSubmissionEvent,
+)
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -154,6 +161,34 @@ def build_scheduler(
                 logger.exception("refresh cycle failed for timeframe %s", timeframe.value)
 
         scheduler.add_job(_job, trigger, id=f"refresh_{timeframe.value}", replace_existing=True)
+
+    def _log_scheduler_event(event: JobExecutionEvent | JobSubmissionEvent) -> None:
+        # Without this, a refresh tick APScheduler decides to skip - a
+        # forward system-clock jump landing more than `misfire_grace_time`
+        # (APScheduler's default: 1s) past the scheduled tick, or the
+        # previous cycle still running when the next one is due
+        # (`max_instances=1`, the default) - is invisible: no exception, no
+        # log line, nothing for a human to notice (red-team Round 2,
+        # fault-injection: clock jump). Not itself a data-correctness risk
+        # (the forecast cache key is `last_closed_ts`-anchored, never
+        # wall-clock, so a skipped tick just delays picking up the next
+        # closed bar rather than corrupting anything - verified directly),
+        # but a silently-skipped refresh should still be observable.
+        if event.code == EVENT_JOB_MISSED:
+            logger.warning("scheduled refresh job missed its run time: %s", event.job_id)
+        elif event.code == EVENT_JOB_MAX_INSTANCES:
+            logger.warning(
+                "scheduled refresh job skipped - previous run still in progress: %s",
+                event.job_id,
+            )
+        elif event.code == EVENT_JOB_ERROR:
+            # Should be unreachable in practice (`_job` above already
+            # catches everything), kept as a last-resort visibility net.
+            logger.error("scheduled refresh job raised out of the executor: %s", event.job_id)
+
+    scheduler.add_listener(
+        _log_scheduler_event, EVENT_JOB_MISSED | EVENT_JOB_MAX_INSTANCES | EVENT_JOB_ERROR
+    )
 
     return scheduler
 

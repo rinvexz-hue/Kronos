@@ -52,7 +52,3 @@ class Settings(BaseSettings):
     @property
     def refresh_timeframe_list(self) -> list[str]:
         return [tf.strip() for tf in self.refresh_timeframes.split(",") if tf.strip()]
-
-
-def get_settings() -> Settings:
-    return Settings()

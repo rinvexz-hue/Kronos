@@ -133,6 +133,17 @@ class CcxtSource:
                 sleep=self._sleep,
                 rng=self._rng,
             )
+            now = self._clock()
+            # Bar construction (row_to_bar - pydantic validation included, e.g.
+            # the NaN/Inf OHLCV guard) is inside this same try block on
+            # purpose: a malformed/truncated row is a failure of this fetch
+            # exactly as much as a network error is, and must be reported the
+            # same well-typed way (`CcxtFetchError`, breaker.on_failure) -
+            # NOT recorded as `on_success()` with a bar list that never gets
+            # built, and NOT allowed to escape as a raw, unwrapped
+            # IndexError/ValueError that `_fetch_with_fallback` doesn't
+            # recognize as retryable/fallback-triggering (red-team Round 2).
+            bars = [self._row_to_bar(source_symbol, timeframe, row, now) for row in raw_rows]
         except Exception as exc:  # deliberately wraps every failure mode into CcxtFetchError
             self._breaker.on_failure(str(exc))
             raise CcxtFetchError(
@@ -140,8 +151,7 @@ class CcxtSource:
             ) from exc
 
         self._breaker.on_success()
-        now = self._clock()
-        return [self._row_to_bar(source_symbol, timeframe, row, now) for row in raw_rows]
+        return bars
 
     def health(self) -> SourceHealth:
         return self._breaker.health(self.name)

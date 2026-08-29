@@ -206,28 +206,40 @@ class SqliteStore:
         it via `source_health()`) — called by `ingest.py` after every fetch
         attempt so state survives process restarts.
         """
-        with self._conn:
-            self._conn.execute(
-                """
-                INSERT INTO source_health
-                    (source_name, ok, last_success_utc, consecutive_failures, last_error)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(source_name) DO UPDATE SET
-                    ok = excluded.ok,
-                    last_success_utc = excluded.last_success_utc,
-                    consecutive_failures = excluded.consecutive_failures,
-                    last_error = excluded.last_error
-                """,
-                (
-                    health.source_name,
-                    int(health.ok),
-                    health.last_success_utc.isoformat(timespec="microseconds")
-                    if health.last_success_utc
-                    else None,
-                    health.consecutive_failures,
-                    health.last_error,
-                ),
-            )
+        try:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT INTO source_health
+                        (source_name, ok, last_success_utc, consecutive_failures, last_error)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(source_name) DO UPDATE SET
+                        ok = excluded.ok,
+                        last_success_utc = excluded.last_success_utc,
+                        consecutive_failures = excluded.consecutive_failures,
+                        last_error = excluded.last_error
+                    """,
+                    (
+                        health.source_name,
+                        int(health.ok),
+                        health.last_success_utc.isoformat(timespec="microseconds")
+                        if health.last_success_utc
+                        else None,
+                        health.consecutive_failures,
+                        health.last_error,
+                    ),
+                )
+        except sqlite3.OperationalError as exc:
+            # Same well-typed translation `upsert_bars` already applies
+            # (red-team Round 2, fault-injection: a persistent SQLite lock
+            # past `busy_timeout` must raise a clear, documented error here
+            # too, not a raw driver exception - this write path had been
+            # missed when `StoreBusyError` was introduced).
+            if "locked" in str(exc).lower():
+                raise StoreBusyError(
+                    f"database locked while recording health for {health.source_name}: {exc}"
+                ) from exc
+            raise
 
     @staticmethod
     def _row_to_bar(row: tuple[str, str, str, float, float, float, float, float, int]) -> Bar:

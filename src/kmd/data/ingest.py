@@ -204,9 +204,24 @@ def run_full_backfill(
     results: dict[tuple[str, str], QualityGateResult] = {}
     for instrument in config.all_instruments():
         for timeframe in config.timeframes.all:
-            result = ingest_instrument(
-                instrument, timeframe, registry, store, backfill_bars=backfill_bars
-            )
+            try:
+                result = ingest_instrument(
+                    instrument, timeframe, registry, store, backfill_bars=backfill_bars
+                )
+            except Exception:
+                # One instrument/timeframe pair whose source is persistently
+                # down/rate-limited (raises uncaught past its own circuit
+                # breaker - e.g. CircuitOpenError with no configured
+                # fallback) must not abort backfill for every OTHER
+                # instrument still queued behind it in this loop. Mirrors
+                # the per-instrument isolation `snapshot.py::build_snapshot`
+                # already applies one layer up (red-team Round 2).
+                logger.exception(
+                    "ingest failed, skipping this pair for this cycle",
+                    symbol=instrument.display_symbol,
+                    timeframe=timeframe.value,
+                )
+                continue
             results[(instrument.display_symbol, timeframe.value)] = result
             if not result.passed:
                 logger.warning(
@@ -232,7 +247,21 @@ def run_incremental_update(
     selected_timeframes = timeframes or config.timeframes.all
     for instrument in config.all_instruments():
         for timeframe in selected_timeframes:
-            result = ingest_instrument(instrument, timeframe, registry, store)
+            try:
+                result = ingest_instrument(instrument, timeframe, registry, store)
+            except Exception:
+                # See the matching comment in `run_full_backfill`: one
+                # persistently-failing source (e.g. a rate-limited exchange
+                # with no configured fallback, whose CircuitOpenError has no
+                # `_FETCH_ERRORS` handler left to catch it) must not abort
+                # the incremental refresh for every OTHER instrument queued
+                # behind it in this loop (red-team Round 2).
+                logger.exception(
+                    "incremental ingest failed, skipping this pair for this cycle",
+                    symbol=instrument.display_symbol,
+                    timeframe=timeframe.value,
+                )
+                continue
             results[(instrument.display_symbol, timeframe.value)] = result
             if not result.passed:
                 logger.warning(

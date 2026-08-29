@@ -15,10 +15,11 @@ a status field showing why it might not be trustworthy right now (e.g.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationInfo, field_validator
 
 RegimeLabel = Literal["trend_up", "trend_down", "range", "unknown"]
 VolRegime = Literal["low", "normal", "high"]
@@ -48,6 +49,26 @@ class ForecastMetrics(BaseModel):
     model_name: str
     generated_at_utc: datetime
     last_closed_bar_ts_utc: datetime
+
+    @field_validator("p_up_24h", "q10", "q50", "q90", "p_vol_expansion", "band_width_pct")
+    @classmethod
+    def must_be_finite(cls, v: float, info: ValidationInfo) -> float:
+        # A NaN/Inf here (e.g. Kronos itself producing NaN paths from an
+        # extreme/edge-case input, independent of whether the input bars
+        # were themselves clean) is not a valid statistic to show as if it
+        # were live. Rejecting it here - at DTO construction, inside
+        # `snapshot.py::_get_or_compute_forecast`, itself inside
+        # `build_snapshot`'s existing per-instrument try/except - degrades
+        # to "this one tile skipped, logged, this cycle" rather than: (a)
+        # `NaN`/`null` reaching the dashboard as a fabricated-looking value,
+        # or (b) surviving `model_dump_json()` (which turns NaN into JSON
+        # `null`) only to make `SnapshotFileStore.load()`'s later
+        # `model_validate` blow up with an uncaught `ValidationError` on
+        # every subsequent `/api/snapshot` request until the next refresh
+        # overwrites the file (red-team Round 2, fault-injection finding).
+        if math.isnan(v) or math.isinf(v):
+            raise ValueError(f"ForecastMetrics.{info.field_name} must be finite, got {v!r}")
+        return v
 
 
 class CalibrationStats(BaseModel):
