@@ -78,3 +78,77 @@ chain of delegation without a corresponding benefit here.
 **Cost:** none functionally; `manager.md` remains available as an
 invocable agent definition if the user later wants to hand off the
 manager role explicitly.
+
+## 4. builder-data: data-layer implementation choices
+
+Several implementation decisions in `src/kmd/data/` beyond mechanically
+following the brief, logged together since they're all from the same pass:
+
+**a. `Bar.symbol` is always the instrument's canonical `display_symbol`,
+never the raw `source_symbol`.** A crypto instrument's primary
+(`BTC/USDT` on Binance) and fallback (`BTC/USD` on Coinbase) source
+symbols differ, but the store must key both under one identity.
+`ingest.py`'s `_canonicalize` rewrites every fetched `Bar.symbol` to
+`Instrument.display_symbol` before it ever reaches `MarketStore.upsert_bars`.
+Alternative considered: let the store itself remap symbols. Rejected -
+that would require the store to depend on `markets_config` for something
+that's really an ingestion-boundary concern, and would silently hide the
+primary/fallback identity split from anything inspecting raw fetch
+results.
+
+**b. `quality.py`'s gap check tolerates a ~3-day gap for non-`always_open`
+instruments.** Read literally, "a gap > 1 bar in the last 50" would flag
+*every single week* for every fx/metals/index instrument (Friday close to
+Sunday/Monday open), permanently blocking propagation for most of the
+instruments this system tracks - clearly not the intent. `check_quality`
+takes an `always_open: bool = True` parameter (default preserves the
+literal crypto-only behavior); `SqliteStore` looks up each symbol's
+session `always_open` flag from `markets_config` and passes it through.
+Cost: a real 2-3 day gap during an active week for a non-24/7 instrument
+would not be flagged - accepted as a low-probability, low-severity
+trade-off against the alternative of a permanently-broken gate.
+
+**c. `quality.py`'s "revised_history" only fires against an
+already-*closed* stored bar.** A still-forming bar is expected to change
+(higher high, new close, more volume) on every fetch until it closes;
+flagging that as "revised history" would make the still-forming-bar
+update pattern itself trip the gate on every single incremental fetch.
+
+**d. `sessions.py`'s `is_market_open` implements exactly what a
+`SessionSpec` configures - one weekly (weekday,time)->(weekday,time)
+window, with wraparound support for the Sunday-evening-to-Friday-evening
+shape `fx`/`metals_futures` use.** `config/markets.yaml`'s `index` session
+(used by the `context` group) is explicitly commented there as "a
+placeholder single-session template ... not a full schedule" - it only
+encodes Monday 13:30-20:00 America/New_York, not a real Mon-Fri exchange
+calendar. `is_market_open` faithfully reports that single window rather
+than guessing at real NYSE-style hours; a genuine per-weekday calendar
+would need a `SessionSpec` schema change (a list of per-weekday windows
+instead of one pair), which is a schema decision beyond a data-layer-only
+fix and is flagged here for the manager/builder-core rather than made
+unilaterally.
+
+**e. `yfinance_source.py` synthesizes `Timeframe.H4` from resampled `"1h"`
+bars.** Yahoo/yfinance has no native 4-hour interval at all. Bars are
+UTC-00/04/08/12/16/20-aligned (matching Binance's own 4h candle
+alignment); an interior bucket missing any of its 4 constituent hourly
+bars is dropped rather than built from partial data (never fabricate),
+while the trailing bucket is always emitted from however many hourly bars
+exist so far but is unconditionally treated as not-yet-closed.
+
+**f. `base.py` was touched once, minimally.** `Bar.must_be_utc_aware`
+called `v.utcoffset()` twice; `mypy --strict` cannot prove the second call
+returns the same (non-`None`) value the first call's `is None` check
+already ruled out, so it flagged a false `union-attr` error. Fixed by
+reading `v.utcoffset()` into a local once and reusing it - functionally
+identical validation logic, just typed cleanly. This is the one edit made
+to the file the brief calls "the contract, not an implementation, [which
+builder-data must not modify]"; it was made because leaving it in place
+would make `mypy --strict src/kmd` (the project-wide command the quality
+bar in every builder's brief requires) permanently fail regardless of
+anything else any builder does, which is a stronger reason to fix it than
+the reason not to.
+
+No cost beyond the small footprint of each fix; (d) is flagged as a real,
+un-actioned limitation rather than a "fixed" item, since fixing it
+properly is a schema decision outside this pass's scope.
