@@ -9,6 +9,17 @@ predicted distribution summary (`p_up_24h`, `q10/q50/q90`,
 the final predicted bar) has fully elapsed, `calibration/score.py` joins
 this against the realized outcome and fills in the score columns.
 
+A row can also end up `unscorable` instead of scored: for a non-24/7
+instrument, a forecast's nominal `horizon_ts` can land inside that
+instrument's closed weekly session, where no bar can ever exist at that
+exact timestamp (red-team Round 1, finding #3). `score.py` first tries to
+resolve against the first real closed bar at-or-after `horizon_ts`; only
+if none arrives within a bounded catch-up window is the row marked
+`unscorable` (`unscorable_at_utc`/`unscorable_reason`) so it stops being
+rescanned on every refresh cycle forever — see `score.py` for the exact
+policy and `DECISIONS.md` for why this was chosen over teaching the
+forecast engine session-awareness.
+
 Stored in its own `forecast_log` table in the same dedicated SQLite file
 as `forecast/cache.py`'s `forecast_cache` table — a file kept deliberately
 separate from builder-data's `SqliteStore` (`Settings.db_path`, `bars` /
@@ -53,9 +64,30 @@ CREATE TABLE IF NOT EXISTS forecast_log (
     brier_score REAL,
     mae_q50 REAL,
     in_band INTEGER,
+    unscorable_at_utc TEXT,
+    unscorable_reason TEXT,
     UNIQUE (symbol, timeframe, last_closed_ts)
 );
 """
+
+# Additive migration for a `forecast_log` table created before the
+# unscorable columns existed (`CREATE TABLE IF NOT EXISTS` above only
+# applies to a brand-new file). Safe to re-run: `duplicate column name` is
+# swallowed, any other `OperationalError` is re-raised.
+_MIGRATIONS = [
+    "ALTER TABLE forecast_log ADD COLUMN unscorable_at_utc TEXT",
+    "ALTER TABLE forecast_log ADD COLUMN unscorable_reason TEXT",
+]
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    for statement in _MIGRATIONS:
+        try:
+            conn.execute(statement)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+    conn.commit()
 
 
 @dataclass(frozen=True)
@@ -84,6 +116,8 @@ class ForecastLogRecord:
     brier_score: float | None = None
     mae_q50: float | None = None
     in_band: bool | None = None
+    unscorable_at_utc: datetime | None = None
+    unscorable_reason: str | None = None
 
 
 def _row_to_record(row: sqlite3.Row) -> ForecastLogRecord:
@@ -114,6 +148,10 @@ def _row_to_record(row: sqlite3.Row) -> ForecastLogRecord:
         brier_score=row["brier_score"],
         mae_q50=row["mae_q50"],
         in_band=bool(row["in_band"]) if row["in_band"] is not None else None,
+        unscorable_at_utc=(
+            datetime.fromisoformat(row["unscorable_at_utc"]) if row["unscorable_at_utc"] else None
+        ),
+        unscorable_reason=row["unscorable_reason"],
     )
 
 
@@ -125,6 +163,7 @@ class CalibrationLogger:
         self._conn.execute("PRAGMA busy_timeout = 5000")
         self._conn.execute(_SCHEMA)
         self._conn.commit()
+        _apply_migrations(self._conn)
 
     def close(self) -> None:
         self._conn.close()
@@ -167,15 +206,32 @@ class CalibrationLogger:
 
     def get_unscored_matured(self, now: datetime) -> list[ForecastLogRecord]:
         """Forecasts whose horizon has fully elapsed as of `now` (caller-
-        supplied, never read from wall-clock internally) and have not yet
-        been scored. Callers must still verify a realized closed bar
-        actually exists at/after `horizon_ts` before scoring — this only
-        filters on the claimed horizon, not on whether data has arrived.
+        supplied, never read from wall-clock internally), have not yet
+        been scored, AND have not been marked `unscorable` (see
+        `mark_unscorable`) — this is what keeps the set this query scans
+        bounded rather than growing forever with rows that structurally
+        can never resolve (red-team Round 1, finding #3). Callers must
+        still verify a realized closed bar actually exists before scoring
+        — this only filters on the claimed horizon, not on whether data
+        has arrived.
         """
         now_iso = now.astimezone(UTC).isoformat()
         rows = self._conn.execute(
-            "SELECT * FROM forecast_log WHERE scored_at_utc IS NULL AND horizon_ts <= ?",
+            "SELECT * FROM forecast_log WHERE scored_at_utc IS NULL "
+            "AND unscorable_at_utc IS NULL AND horizon_ts <= ?",
             (now_iso,),
+        ).fetchall()
+        return [_row_to_record(row) for row in rows]
+
+    def get_unscorable(self, symbol: str, timeframe: Timeframe) -> list[ForecastLogRecord]:
+        """Rows marked `unscorable` (for introspection/tests — the
+        dashboard's `CalibrationStats` never counts these one way or the
+        other, they are simply excluded from the pending-scan set).
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM forecast_log WHERE symbol = ? AND timeframe = ? "
+            "AND unscorable_at_utc IS NOT NULL",
+            (symbol, timeframe.value),
         ).fetchall()
         return [_row_to_record(row) for row in rows]
 
@@ -206,5 +262,19 @@ class CalibrationLogger:
                 int(in_band),
                 record_id,
             ),
+        )
+        self._conn.commit()
+
+    def mark_unscorable(self, record_id: int, *, at_utc: datetime, reason: str) -> None:
+        """Marks a row as permanently excluded from `get_unscored_matured`
+        without ever having been scored — used when no real closed bar
+        arrived within the catch-up window `score.py` allows (see its
+        `MAX_HORIZON_CATCHUP`), e.g. an extended session closure or a real
+        data outage. Never touches `scored_at_utc`/the score columns:
+        "unscorable" and "scored" are mutually exclusive states.
+        """
+        self._conn.execute(
+            "UPDATE forecast_log SET unscorable_at_utc = ?, unscorable_reason = ? WHERE id = ?",
+            (at_utc.astimezone(UTC).isoformat(), reason, record_id),
         )
         self._conn.commit()

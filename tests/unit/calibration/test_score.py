@@ -12,11 +12,13 @@ timestamp.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
 from kmd.calibration.logger import CalibrationLogger, ForecastLogRecord
 from kmd.calibration.score import (
+    MAX_HORIZON_CATCHUP,
     aggregate_calibration_stats,
     score_matured_forecasts,
     score_single,
@@ -262,3 +264,164 @@ def test_score_matured_forecasts_leaves_unscored_when_no_bar_at_horizon_yet(tmp_
     scored = score_matured_forecasts(logger, store, now=horizon_ts + timedelta(hours=1))
     assert scored == 0
     assert len(logger.get_unscored_matured(horizon_ts + timedelta(hours=1))) == 1
+
+
+def test_score_matured_forecasts_resolves_weekend_horizon_against_first_reopen_bar(tmp_path: Path) -> None:
+    """Regression test for red-team Round 1 finding #3.
+
+    EUR/USD's `fx` session (see `config/markets.yaml`) closes Friday
+    22:00 UTC and reopens Sunday 22:00 UTC. A forecast generated Friday
+    morning with `pred_len=24` (1h timeframe) gets a nominal `horizon_ts`
+    that lands Saturday - squarely inside the closed weekend - where no
+    bar can ever exist at that exact timestamp. It must still eventually
+    get scored, against the first real bar once trading resumes, rather
+    than being silently and permanently excluded from calibration.
+    """
+    last_closed_ts = datetime(2026, 1, 2, 3, 0, tzinfo=UTC)  # Friday 03:00 UTC
+    horizon_ts = last_closed_ts + timedelta(hours=24)  # Saturday 03:00 UTC
+    assert horizon_ts.weekday() == 5  # Saturday - confirms the fixture actually lands mid-weekend
+
+    logger = CalibrationLogger(tmp_path / "cal.sqlite3")
+    logger.log_forecast(
+        ForecastLogRecord(
+            symbol="EUR/USD",
+            timeframe=Timeframe.H1,
+            generated_at_utc=last_closed_ts,
+            last_closed_ts=last_closed_ts,
+            horizon_ts=horizon_ts,
+            lookback_bars=400,
+            pred_len=24,
+            model_name="fake-model",
+            temperature=1.0,
+            top_p=0.9,
+            top_k=0,
+            n_paths=30,
+            last_close=1.0800,
+            p_up_24h=0.55,
+            q10=1.0750,
+            q50=1.0820,
+            q90=1.0900,
+            p_vol_expansion=0.2,
+            band_width_pct=0.014,
+        )
+    )
+
+    # No bar exists (or ever will) at the exact Saturday horizon - the
+    # market is closed. The first real bar is Sunday evening, once
+    # trading resumes.
+    reopen_bar_ts = datetime(2026, 1, 4, 23, 0, tzinfo=UTC)  # Sunday 23:00 UTC
+    store = FakeMarketStore()
+    store.set_bars(
+        "EUR/USD",
+        Timeframe.H1,
+        [
+            make_bar(
+                symbol="EUR/USD",
+                ts_utc=reopen_bar_ts,
+                open_=1.0850,
+                high=1.0860,
+                low=1.0840,
+                close=1.0855,
+                is_closed=True,
+            )
+        ],
+    )
+
+    # Before reopen: matured by the clock, but no bar yet - must stay
+    # pending, not be marked unscorable (still well within the catch-up
+    # window).
+    still_weekend_now = horizon_ts + timedelta(hours=6)
+    assert score_matured_forecasts(logger, store, now=still_weekend_now) == 0
+    assert len(logger.get_unscored_matured(still_weekend_now)) == 1
+    assert logger.get_unscorable("EUR/USD", Timeframe.H1) == []
+
+    # Once the reopen bar exists, it resolves the forecast.
+    scored = score_matured_forecasts(logger, store, now=reopen_bar_ts + timedelta(hours=1))
+    assert scored == 1
+    [record] = logger.get_scored("EUR/USD", Timeframe.H1)
+    assert record.mae_q50 == pytest.approx(abs(1.0820 - 1.0855))
+    assert record.in_band is True  # 1.0855 is within [1.0750, 1.0900]
+    assert logger.get_unscored_matured(reopen_bar_ts + timedelta(hours=1)) == []
+
+
+def test_score_matured_forecasts_marks_unscorable_after_catchup_window_elapses(tmp_path: Path) -> None:
+    """If no bar EVER arrives within `MAX_HORIZON_CATCHUP` (a genuine
+    multi-day data outage, not just a weekly close), the forecast is
+    marked unscorable instead of being rescanned forever.
+    """
+    horizon_ts = BASE_TS + timedelta(hours=24)
+    logger = CalibrationLogger(tmp_path / "cal.sqlite3")
+    logger.log_forecast(_gold_forecast_record(horizon_ts))
+
+    store = FakeMarketStore()  # never gets any bars in this test
+
+    just_before_deadline = horizon_ts + MAX_HORIZON_CATCHUP - timedelta(minutes=1)
+    assert score_matured_forecasts(logger, store, now=just_before_deadline) == 0
+    assert logger.get_unscorable("GOUD", Timeframe.H1) == []  # not yet - still within the window
+
+    just_after_deadline = horizon_ts + MAX_HORIZON_CATCHUP + timedelta(minutes=1)
+    assert score_matured_forecasts(logger, store, now=just_after_deadline) == 0
+    [unscorable] = logger.get_unscorable("GOUD", Timeframe.H1)
+    assert unscorable.unscorable_reason is not None
+    assert unscorable.scored_at_utc is None  # unscorable and scored are mutually exclusive
+
+    # Bounded scan: it must not show up in get_unscored_matured anymore.
+    assert logger.get_unscored_matured(just_after_deadline + timedelta(days=1)) == []
+
+    # Even if a bar shows up much later, an already-unscorable row is not
+    # retroactively scored (it would be a stale/unrelated data point).
+    store.set_bars(
+        "GOUD",
+        Timeframe.H1,
+        [make_bar(symbol="GOUD", ts_utc=horizon_ts + timedelta(days=10), open_=2000, high=2001, low=1999, close=2000, is_closed=True)],
+    )
+    assert score_matured_forecasts(logger, store, now=horizon_ts + timedelta(days=11)) == 0
+    assert logger.get_scored("GOUD", Timeframe.H1) == []
+
+
+def test_score_matured_forecasts_never_uses_a_bar_after_now(tmp_path: Path) -> None:
+    """Defensive look-ahead check: even a real closed bar within the
+    catch-up window must not be used to score if its own timestamp is
+    after the caller's `now` (a clock-skew edge case, not exercised by
+    normal operation, but the invariant should hold regardless)."""
+    horizon_ts = BASE_TS + timedelta(hours=24)
+    logger = CalibrationLogger(tmp_path / "cal.sqlite3")
+    logger.log_forecast(_gold_forecast_record(horizon_ts))
+
+    store = FakeMarketStore()
+    future_bar_ts = horizon_ts + timedelta(hours=2)
+    store.set_bars(
+        "GOUD",
+        Timeframe.H1,
+        [make_bar(symbol="GOUD", ts_utc=future_bar_ts, open_=2000, high=2001, low=1999, close=2000, is_closed=True)],
+    )
+
+    # `now` is BEFORE the only candidate bar's own timestamp.
+    scored = score_matured_forecasts(logger, store, now=horizon_ts + timedelta(hours=1))
+    assert scored == 0
+    assert logger.get_scored("GOUD", Timeframe.H1) == []
+
+
+
+def _gold_forecast_record(horizon_ts: datetime) -> ForecastLogRecord:
+    return ForecastLogRecord(
+        symbol="GOUD",
+        timeframe=Timeframe.H1,
+        generated_at_utc=horizon_ts - timedelta(hours=24),
+        last_closed_ts=horizon_ts - timedelta(hours=24),
+        horizon_ts=horizon_ts,
+        lookback_bars=400,
+        pred_len=24,
+        model_name="fake-model",
+        temperature=1.0,
+        top_p=0.9,
+        top_k=0,
+        n_paths=30,
+        last_close=2000.0,
+        p_up_24h=0.5,
+        q10=1990.0,
+        q50=2000.0,
+        q90=2010.0,
+        p_vol_expansion=0.2,
+        band_width_pct=0.01,
+    )
