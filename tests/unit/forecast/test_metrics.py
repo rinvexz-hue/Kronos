@@ -20,7 +20,7 @@ def test_p_up_24h_known_fraction() -> None:
 
 
 def test_p_up_24h_all_up() -> None:
-    paths = [[1, 2, 3], [1, 2, 3.5]]
+    paths = [[1.0, 2.0, 3.0], [1.0, 2.0, 3.5]]
     assert metrics.p_up_24h(paths, last_close=1.0) == 1.0
 
 

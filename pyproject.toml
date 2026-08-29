@@ -45,6 +45,11 @@ where = ["src"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# Vendored upstream Kronos source, not owned/authored by this project — see
+# NOTES/kronos_api.md and DECISIONS.md #1. `mypy`'s `files` setting already
+# scopes to `src/kmd`; `ruff` needs the same exclusion since it otherwise
+# lints the whole repo by default.
+extend-exclude = ["third_party"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
@@ -62,7 +67,11 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+# The `network` marker's own docstring below promises exclusion from the
+# default run; `-m "not network"` is what actually makes that true (a
+# registered marker alone doesn't skip anything). Run `pytest -m network`
+# explicitly to opt into the one real-model integration test that needs it.
+addopts = "-ra -m \"not network\""
 markers = [
     "network: requires network access (excluded from default CI run)",
 ]
