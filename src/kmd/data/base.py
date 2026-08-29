@@ -9,11 +9,12 @@ interface, not an implementation.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from enum import StrEnum
 from typing import Literal, Protocol, runtime_checkable
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ValidationInfo, field_validator
 
 
 class Timeframe(StrEnum):
@@ -59,6 +60,21 @@ class Bar(BaseModel):
             raise ValueError("Bar.ts_utc must be timezone-aware")
         if offset.total_seconds() != 0:
             raise ValueError("Bar.ts_utc must be normalized to UTC (offset must be 0)")
+        return v
+
+    @field_validator("open", "high", "low", "close", "volume")
+    @classmethod
+    def must_be_finite(cls, v: float, info: ValidationInfo) -> float:
+        # A real market reading is never NaN or +-Inf. A source occasionally
+        # returns NaN for a genuinely illiquid period (observed in practice
+        # from yfinance) rather than raising; silently accepting it here
+        # would let a single poisoned field propagate through every
+        # downstream computation (vol, quantiles, the model's own input
+        # tensor) as an untyped, unflagged failure instead of the well-typed
+        # fetch error `MarketSource.fetch_ohlcv`'s own contract requires
+        # (red-team Round 2, fault-injection finding on NaN propagation).
+        if math.isnan(v) or math.isinf(v):
+            raise ValueError(f"Bar.{info.field_name} must be a finite number, got {v!r}")
         return v
 
 
