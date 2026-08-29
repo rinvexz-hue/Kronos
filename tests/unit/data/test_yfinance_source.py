@@ -8,6 +8,7 @@ from __future__ import annotations
 import random
 from datetime import UTC, timedelta
 
+import pandas as pd
 import pytest
 
 from kmd.data.base import Timeframe
@@ -166,6 +167,48 @@ def test_persistent_failure_raises_yf_fetch_error() -> None:
     with pytest.raises(YfFetchError):
         source.fetch_ohlcv("GC=F", Timeframe.H1, since=None, limit=1000)
     assert source.health().ok is False
+
+
+def test_nan_close_is_raised_as_yf_fetch_error_not_silently_returned() -> None:
+    """Red-team Round 2 (fault injection): a real yfinance response for a
+    genuinely illiquid period can carry a NaN close rather than raising -
+    observed directly against the real `YfinanceSource` code path here, not
+    just asserted. Before the `Bar` NaN/Inf guard + widened try/except,
+    this silently returned a `Bar(close=nan, is_closed=True)` to the caller
+    and recorded the fetch as a *success* (breaker never learned anything
+    was wrong) - the exact "malformed response treated as valid data"
+    failure mode the brief calls out.
+    """
+    nan_frame = HOURLY_FRAME.copy()
+    nan_frame.iloc[-1, nan_frame.columns.get_loc("Close")] = float("nan")
+    ticker = FakeYfTicker(nan_frame)
+    clock = FrozenClock(LAST_HOURLY_OPEN_UTC + timedelta(hours=2))
+    source = _source(ticker, clock=clock)
+
+    with pytest.raises(YfFetchError, match="must be a finite number"):
+        source.fetch_ohlcv("GC=F", Timeframe.H1, since=None, limit=1000)
+
+    health = source.health()
+    assert health.ok is False  # correctly recorded as a failure, not a success
+    assert health.consecutive_failures == 1
+
+
+def test_empty_response_is_not_an_error_but_yields_zero_bars() -> None:
+    """An empty frame (e.g. a genuinely malformed/empty upstream response,
+    or - legitimately - no new bars since the last incremental check) is
+    NOT wrapped as a failure today: it returns `[]` and the breaker records
+    a success. Documented here as the current (accepted for incremental,
+    ambiguous for a first backfill) behavior - see REVIEW.md Round 2.
+    """
+    empty_frame = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+    ticker = FakeYfTicker(empty_frame)
+    clock = FrozenClock(LAST_HOURLY_OPEN_UTC)
+    source = _source(ticker, clock=clock)
+
+    bars = source.fetch_ohlcv("GC=F", Timeframe.H1, since=None, limit=1000)
+
+    assert bars == []
+    assert source.health().ok is True
 
 
 def test_limit_truncates_from_the_most_recent_end() -> None:

@@ -127,6 +127,44 @@ def test_circuit_breaker_opens_after_repeated_failures_across_calls() -> None:
     assert len(exchange.calls) == calls_before
 
 
+def test_malformed_row_is_raised_as_ccxt_fetch_error_not_silently_returned() -> None:
+    """Red-team Round 2 (fault injection): a truncated/garbage OHLCV row
+    (fewer than 6 fields) used to raise a raw, unwrapped `IndexError`
+    *after* `breaker.on_success()` had already been called - recorded as a
+    healthy fetch despite never actually producing a usable bar, and not
+    recognized by `_fetch_with_fallback` as one of `_FETCH_ERRORS`, so a
+    configured fallback would never even be tried. Confirmed here against
+    the real `CcxtSource` code path.
+    """
+    exchange = FakeCcxtExchange([[1_700_000_000_000, 100.0, 101.0]])  # missing low/close/volume
+    clock = FrozenClock(datetime.fromtimestamp(1_700_000_000, tz=UTC) + timedelta(hours=1))
+    source = _source(exchange, clock=clock)
+
+    with pytest.raises(CcxtFetchError, match="list index out of range"):
+        source.fetch_ohlcv("BTC/USDT", Timeframe.H1, since=None, limit=60)
+
+    health = source.health()
+    assert health.ok is False  # correctly recorded as a failure, not a success
+    assert health.consecutive_failures == 1
+
+
+def test_nan_close_is_raised_as_ccxt_fetch_error_not_silently_returned() -> None:
+    """Same failure mode, this time from a well-formed-shape row whose
+    close is NaN (e.g. an exchange-side data glitch) rather than a
+    truncated one - the `Bar` NaN/Inf guard is what actually catches this;
+    this test proves it's wired all the way through to a well-typed,
+    breaker-recorded `CcxtFetchError` rather than a silently-accepted
+    poisoned bar.
+    """
+    exchange = FakeCcxtExchange([[1_700_000_000_000, 100.0, 101.0, 99.0, float("nan"), 10.0]])
+    clock = FrozenClock(datetime.fromtimestamp(1_700_000_000, tz=UTC) + timedelta(hours=1))
+    source = _source(exchange, clock=clock)
+
+    with pytest.raises(CcxtFetchError, match="must be a finite number"):
+        source.fetch_ohlcv("BTC/USDT", Timeframe.H1, since=None, limit=60)
+    assert source.health().ok is False
+
+
 def test_source_name_defaults_to_ccxt_prefixed_exchange_id() -> None:
     exchange = FakeCcxtExchange(BTC_1H_ROWS, id="binance")
     source = CcxtSource(exchange)
