@@ -75,11 +75,18 @@ function fmtDateTime(isoString) {
   if (!isoString) return "—";
   const date = new Date(isoString);
   if (Number.isNaN(date.getTime())) return "—";
+  // Explicit timeZone: the API always returns UTC-aware ISO timestamps: the
+  // presentation layer is the ONLY place that should convert to local time,
+  // and it must do so to a fixed zone (Europe/Amsterdam), not whatever
+  // timezone the viewing browser/OS happens to be set to (a laptop with its
+  // OS clock set to another region, a remote/CI preview, etc. would
+  // otherwise silently mislabel every displayed timestamp).
   return new Intl.DateTimeFormat("nl-NL", {
     day: "2-digit",
     month: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
+    timeZone: "Europe/Amsterdam",
   }).format(date);
 }
 
