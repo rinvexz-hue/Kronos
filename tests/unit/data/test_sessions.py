@@ -83,4 +83,4 @@ def test_malformed_weekday_time_raises_session_config_error() -> None:
 
 def test_naive_now_raises_value_error() -> None:
     with pytest.raises(ValueError, match="tz-aware"):
-        is_market_open(FX, datetime(2024, 1, 3, 12, 0))  # noqa: DTZ001 - deliberately naive
+        is_market_open(FX, datetime(2024, 1, 3, 12, 0))
