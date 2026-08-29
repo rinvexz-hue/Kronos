@@ -10,13 +10,13 @@ interface, not an implementation.
 from __future__ import annotations
 
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, field_validator
 
 
-class Timeframe(str, Enum):
+class Timeframe(StrEnum):
     H1 = "1h"
     H4 = "4h"
     D1 = "1d"
