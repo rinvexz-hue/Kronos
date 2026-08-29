@@ -460,6 +460,53 @@ network comes back mid-backoff; does a real weekend gap in a fixture
 resolve the way the new regression test claims against the real
 `SqliteStore`, not just `FakeMarketStore`).
 
+### Manager verification + finding #2 closure (post-fix, pre-Round-2)
+
+Independently re-ran (not trusting builder-core's self-report alone):
+`ruff check .`, `python -m mypy` (note: use `python -m mypy`, not the bare
+`mypy` binary — that binary is an isolated `uv tool install` with no
+visibility into project dependencies and will falsely report every
+third-party import as missing), and `python -m pytest tests -q` — all
+clean, 187 passed / 1 deselected, matching builder-core's report exactly.
+
+Then actually ran the app end-to-end (`cp .env.example .env && python -m
+kmd`) on what was otherwise a clean checkout, which found one more real
+bug builder-core's fix didn't touch: **`SqliteStore.__init__` never
+created its `db_path`'s parent directory**, so the default
+`KMD_DB_PATH=./data/kmd.sqlite3` crashed the (now-background) startup
+thread with `sqlite3.OperationalError: unable to open database file` on
+any checkout where `./data/` doesn't already exist — which is every fresh
+clone, since it's gitignored runtime state. `ForecastCache` and
+`CalibrationLogger` already did `db_path.parent.mkdir(parents=True,
+exist_ok=True)` for exactly this reason; `SqliteStore` (written earlier,
+before that pattern existed) was missing the same one line. Fixed
+directly (commit `6630269`) — small, unambiguous, matches an existing
+in-codebase pattern exactly, same bar `red-team`'s own brief uses for a
+direct fix.
+
+Re-verified live after that fix: `/healthz` reachable within ~5s of
+process start (Python/torch/pandas import time, not network-dependent)
+reporting `{"status":"backfilling","ready":false}`; `/api/snapshot`
+correctly `503`s with `{"detail":"snapshot not yet available"}` rather
+than lying; the static frontend at `/` serves immediately. This is the
+first time in this project that "run the app for real" was verified to
+actually work past process start, on a genuinely fresh (`rm -rf ./data`)
+state, not just via `pytest`.
+
+**Finding #2 (no README) — closed.** Wrote `README.md`: prerequisites,
+the 3-command setup, an explicit description of what the fixed
+non-blocking startup sequence does and how to read `/healthz`'s
+`status` progression, how to run the tests, a short architecture pointer
+into the contract files, and a "Beperkingen" section stating plainly (in
+Dutch, matching the dashboard's own language) what this system does not
+do — including the still-open items below rather than glossing over them.
+
+None of this is a red-team re-verification or a Round 2 fault-injection
+pass — it's the manager's own integration check, kept separate from
+red-team's findings above on purpose. The Gates checklist immediately
+above this section is left exactly as red-team wrote it; Round 2 is
+still the pass that gets to move those checkboxes.
+
 ## Round 2 — robustness (fault injection)
 
 _Not started._
