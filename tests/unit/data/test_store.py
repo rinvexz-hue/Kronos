@@ -6,6 +6,7 @@ real `config/markets.yaml`'s exact instrument list.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from hypothesis import HealthCheck, given, settings
@@ -177,6 +178,141 @@ def test_source_health_round_trips(store: SqliteStore) -> None:
 
 
 def test_close_does_not_raise(store: SqliteStore) -> None:
+    store.close()
+
+
+# --- Real SQLite lock contention (red-team Round 2, fault injection) -----
+#
+# `:memory:` can't reproduce this at all (no file to contend over), so
+# these use a real on-disk file and a genuinely separate `sqlite3.connect`
+# handle holding a real write lock - not a mock of `sqlite3.OperationalError`.
+
+
+def test_busy_timeout_waits_out_a_lock_released_in_time(tmp_path: Path) -> None:
+    """A write lock held by another connection for LESS time than
+    `busy_timeout` must simply be waited out - `upsert_bars` blocks, then
+    succeeds, with the bar actually persisted. Proves `busy_timeout` is not
+    just set but genuinely effective.
+    """
+    import sqlite3
+    import threading
+    import time
+
+    db_path = tmp_path / "lock_test.sqlite3"
+    store = SqliteStore(db_path, markets_config=_TEST_CONFIG, busy_timeout_ms=3000)
+    bar = Bar(
+        symbol=SYMBOL, timeframe=TF, ts_utc=T0, open=100.0, high=101.0, low=99.0,
+        close=100.0, volume=1.0, is_closed=True,
+    )
+
+    blocker = sqlite3.connect(str(db_path))
+    blocker.execute("BEGIN IMMEDIATE")
+    blocker.execute("CREATE TABLE IF NOT EXISTS _lock_probe(x)")  # touch it under the txn
+
+    outcome: dict[str, object] = {}
+
+    def _do_upsert() -> None:
+        t0 = time.monotonic()
+        outcome["result"] = store.upsert_bars([bar])
+        outcome["elapsed"] = time.monotonic() - t0
+
+    t = threading.Thread(target=_do_upsert)
+    t.start()
+    time.sleep(0.5)  # hold the lock well under the 3s busy_timeout
+    blocker.commit()
+    blocker.close()
+    t.join(timeout=5)
+
+    assert not t.is_alive()
+    assert outcome["result"].passed  # type: ignore[union-attr]
+    assert outcome["elapsed"] >= 0.4  # actually waited for the lock, not a no-op
+    assert len(store.get_latest_bars(SYMBOL, TF, 10)) == 1
+    store.close()
+
+
+def test_busy_timeout_exhausted_raises_store_busy_error_not_a_hang(tmp_path: Path) -> None:
+    """A write lock held PAST `busy_timeout` must raise `StoreBusyError`
+    cleanly (bounded time, well-typed exception) rather than hanging
+    forever or silently losing the write.
+    """
+    import sqlite3
+    import threading
+
+    from kmd.data.store import StoreBusyError
+
+    db_path = tmp_path / "lock_test_persistent.sqlite3"
+    store = SqliteStore(db_path, markets_config=_TEST_CONFIG, busy_timeout_ms=800)
+    bar = Bar(
+        symbol=SYMBOL, timeframe=TF, ts_utc=T0, open=100.0, high=101.0, low=99.0,
+        close=100.0, volume=1.0, is_closed=True,
+    )
+
+    blocker = sqlite3.connect(str(db_path))
+    blocker.execute("BEGIN IMMEDIATE")
+    blocker.execute("CREATE TABLE IF NOT EXISTS _lock_probe(x)")
+    # Deliberately never committed/rolled back until after the assertion.
+
+    outcome: dict[str, object] = {}
+
+    def _do_upsert() -> None:
+        try:
+            outcome["result"] = store.upsert_bars([bar])
+        except Exception as exc:
+            outcome["error"] = exc
+
+    t = threading.Thread(target=_do_upsert)
+    t.start()
+    t.join(timeout=5)  # must finish well within busy_timeout + slack, never hang
+
+    assert not t.is_alive()
+    assert isinstance(outcome.get("error"), StoreBusyError)
+    assert "locked" in str(outcome["error"]).lower()
+    # No silent data loss disguised as success: nothing was written.
+    blocker.rollback()
+    blocker.close()
+    assert len(store.get_latest_bars(SYMBOL, TF, 10)) == 0
+    store.close()
+
+
+def test_record_source_health_also_raises_store_busy_error_on_persistent_lock(tmp_path: Path) -> None:
+    """`record_source_health` shares the same file/connection as
+    `upsert_bars` but had its own, separate write path - this confirms it
+    got the same `StoreBusyError` translation, not just `upsert_bars`.
+    """
+    import sqlite3
+    import threading
+
+    from kmd.data.base import SourceHealth
+    from kmd.data.store import StoreBusyError
+
+    db_path = tmp_path / "lock_test_health.sqlite3"
+    store = SqliteStore(db_path, markets_config=_TEST_CONFIG, busy_timeout_ms=800)
+
+    blocker = sqlite3.connect(str(db_path))
+    blocker.execute("BEGIN IMMEDIATE")
+    blocker.execute("CREATE TABLE IF NOT EXISTS _lock_probe(x)")
+
+    outcome: dict[str, object] = {}
+
+    def _do_record() -> None:
+        try:
+            store.record_source_health(
+                SourceHealth(
+                    source_name="ccxt:binance", ok=True, last_success_utc=T0,
+                    consecutive_failures=0, last_error=None,
+                )
+            )
+        except Exception as exc:
+            outcome["error"] = exc
+
+    t = threading.Thread(target=_do_record)
+    t.start()
+    t.join(timeout=5)
+
+    assert not t.is_alive()
+    assert isinstance(outcome.get("error"), StoreBusyError)
+    blocker.rollback()
+    blocker.close()
     store.close()
 
 

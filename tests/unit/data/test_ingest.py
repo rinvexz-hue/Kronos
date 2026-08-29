@@ -305,6 +305,79 @@ def test_route_for_yfinance_without_fallback_symbol_has_no_fallback() -> None:
     assert route.fallback_symbol is None
 
 
+_TWO_INSTRUMENT_CONFIG = MarketsConfig.model_validate(
+    {
+        "timeframes": {"primary": "1h", "secondary": []},
+        "forecast": {"lookback_bars": 400, "pred_len": 24},
+        "sessions": {"crypto": {"always_open": True}},
+        "groups": {
+            "crypto": {
+                "session": "crypto",
+                "instruments": [
+                    {
+                        "display_symbol": "AAA/USDT",
+                        "decimals": 2,
+                        "source": "ccxt",
+                        "exchange": "flaky",
+                        "source_symbol": "AAA/USDT",
+                    },
+                    {
+                        "display_symbol": "BBB/USDT",
+                        "decimals": 2,
+                        "source": "ccxt",
+                        "exchange": "healthy",
+                        "source_symbol": "BBB/USDT",
+                    },
+                ],
+            }
+        },
+        "risk": {"min_rr_for_setup": 2.0, "default_risk_pct": 2.0},
+        "calibration": {"min_observations_for_display": 30, "target_band_coverage": 0.8},
+    }
+)
+
+
+def test_run_full_backfill_isolates_one_persistently_failing_instrument() -> None:
+    """Red-team Round 2 (fault injection): a source stuck returning 429s
+    forever (no fallback configured) must not prevent every OTHER
+    instrument's backfill in the same cycle from running - mirrors the
+    per-instrument isolation `snapshot.py::build_snapshot` already has one
+    layer up. Before this fix, `ingest_instrument` raising uncaught for
+    "AAA/USDT" aborted the loop before "BBB/USDT" was ever attempted.
+    """
+    registry = SourceRegistry()
+    registry.register_ccxt("flaky", FakeSource("ccxt:flaky", [], fail_times=999))
+    healthy = FakeSource("ccxt:healthy", make_bars("BBB/USDT", 5))
+    registry.register_ccxt("healthy", healthy)
+    store = SqliteStore(":memory:", markets_config=_TWO_INSTRUMENT_CONFIG)
+
+    results = run_full_backfill(_TWO_INSTRUMENT_CONFIG, registry, store)
+
+    assert len(healthy.calls) == 1  # actually reached, not skipped by an earlier crash
+    assert ("BBB/USDT", "1h") in results
+    assert results[("BBB/USDT", "1h")].passed
+    assert len(store.get_latest_bars("BBB/USDT", Timeframe.H1, 100)) == 5
+    # The failing pair is simply absent from the results dict, not present
+    # with a fabricated "passed" result.
+    assert ("AAA/USDT", "1h") not in results
+
+
+def test_run_incremental_update_isolates_one_persistently_failing_instrument() -> None:
+    """Same guarantee as above, for the recurring incremental-refresh path
+    the scheduler actually calls every cycle."""
+    registry = SourceRegistry()
+    registry.register_ccxt("flaky", FakeSource("ccxt:flaky", [], fail_times=999))
+    healthy = FakeSource("ccxt:healthy", make_bars("BBB/USDT", 3))
+    registry.register_ccxt("healthy", healthy)
+    store = SqliteStore(":memory:", markets_config=_TWO_INSTRUMENT_CONFIG)
+
+    results = run_incremental_update(_TWO_INSTRUMENT_CONFIG, registry, store)
+
+    assert len(healthy.calls) == 1
+    assert ("BBB/USDT", "1h") in results
+    assert ("AAA/USDT", "1h") not in results
+
+
 def test_circuit_open_error_on_primary_triggers_fallback() -> None:
     registry = SourceRegistry()
     binance = FakeSource("ccxt:binance", [], fail_times=1, exc=CircuitOpenError("open"))
